@@ -78,8 +78,13 @@ const getEmailTransporter = () => {
 
             return nodemailer.createTransport({
                 host: 'smtp.gmail.com',
-                port: 465,
-                secure: true,
+                port: 587,
+                secure: false,
+                requireTLS: true,
+                tls: {
+                    rejectUnauthorized: true,
+                },
+                family: 4,
                 auth: {
                     user: emailUser,
                     pass: emailPassword,
@@ -182,7 +187,7 @@ export const sendEmailOTP = async (email, otp) => {
 
         // Determine sender email
         const senderEmail = getDefaultSenderEmail();
-        const senderName = getTrimmedEnv('SENDGRID_FROM_NAME') || 'ChatApp Support';
+        const senderName = getTrimmedEnv('EMAIL_FROM_NAME') || getTrimmedEnv('SENDGRID_FROM_NAME') || 'ChatApp Support';
 
         // Email options
         const mailOptions = {
@@ -274,7 +279,7 @@ export const sendEmailVerification = async (email, otp) => {
         }
 
         const senderEmail = getDefaultSenderEmail();
-        const senderName = getTrimmedEnv('SENDGRID_FROM_NAME') || 'ChatApp Support';
+        const senderName = getTrimmedEnv('EMAIL_FROM_NAME') || getTrimmedEnv('SENDGRID_FROM_NAME') || 'ChatApp Support';
 
         const mailOptions = {
             from: `${senderName} <${senderEmail}>`,
