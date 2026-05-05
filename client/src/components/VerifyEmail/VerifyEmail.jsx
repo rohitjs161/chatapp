@@ -29,6 +29,7 @@ const VerifyEmail = () => {
   const navigate = useNavigate();
   const location = useLocation();
   const email = location.state?.email;
+  const emailSent = location.state?.emailSent !== false; // Default to true if not specified
   const flowType = location.pathname === '/verify-email-change' ? 'email-change' : 'signup';
   const { updateUser, user } = useAuthStore();
   const { isLocked: isSubmitting, runLockedAction } = useActionLock();
@@ -244,6 +245,12 @@ const VerifyEmail = () => {
             </div>
           )}
 
+          {!emailSent && (
+            <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-800 shadow-sm">
+              ⚠️ The verification email could not be delivered. Please click "Resend OTP" below to send it again.
+            </div>
+          )}
+
           <div className="text-center mb-8">
             <div className="flex justify-center mb-4">
               <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-500 to-purple-600 shadow-lg">
@@ -252,7 +259,11 @@ const VerifyEmail = () => {
             </div>
             <h1 className="text-3xl font-bold text-slate-900">Verify Your Email</h1>
             <p className="mt-2 text-sm text-slate-600">
-              We've sent a 6-digit OTP to<br />
+              {emailSent ? (
+                <>We've sent a 6-digit OTP to<br /></>
+              ) : (
+                <>Once you receive the OTP, enter it below.<br /></>
+              )}
               <span className="font-semibold text-slate-800">{email}</span>
             </p>
           </div>

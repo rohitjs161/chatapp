@@ -157,8 +157,8 @@ const SignUp = () => {
         }
 
         try {
-          await register(payload);
-          navigate('/verify-otp', { state: { email: payload.email } });
+          const response = await register(payload);
+          navigate('/verify-otp', { state: { email: payload.email, emailSent: response?.data?.emailSent } });
         } catch (err) {
           const status = Number(err?.response?.status);
           const serverMessage = err?.response?.data?.message || err?.message || '';

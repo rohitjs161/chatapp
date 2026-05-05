@@ -405,37 +405,40 @@ const registerUser = asyncHandler(async (req, res) => {
 
             try {
                 await sendEmailVerification(emailNormalized, verificationOTP);
+                logger.log('✅ Verification email sent successfully for existing pending registration');
+                
+                return res.status(200).json(
+                    new apiResponse(
+                        200,
+                        {
+                            email: emailNormalized,
+                            username: usernameNormalized,
+                            otpResent: true,
+                            emailSent: true,
+                        },
+                        'OTP resent. Please verify your email.'
+                    )
+                );
             } catch (error) {
                 logger.error('Signup verification email could not be sent for existing pending registration:', {
                     message: error?.message,
                     code: error?.code,
                 });
 
-                return res.status(202).json(
+                return res.status(200).json(
                     new apiResponse(
-                        202,
+                        200,
                         {
                             email: emailNormalized,
                             username: usernameNormalized,
                             verificationPending: true,
                             otpResent: false,
+                            emailSent: false,
                         },
-                        'Account saved. Verification email could not be delivered right now. Please try again from resend OTP.'
+                        'Account saved. Verification email could not be delivered. Please check your email or use "Resend OTP" to try again.'
                     )
                 );
             }
-
-            return res.status(200).json(
-                new apiResponse(
-                    200,
-                    {
-                        email: emailNormalized,
-                        username: usernameNormalized,
-                        otpResent: true,
-                    },
-                    'OTP resent. Please verify your email.'
-                )
-            );
         }
 
         pendingRegistration = await PendingRegistration.create({
@@ -453,21 +456,36 @@ const registerUser = asyncHandler(async (req, res) => {
 
         try {
             await sendEmailVerification(emailNormalized, verificationOTP);
+            logger.log('✅ Verification email sent successfully for new pending registration');
+
+            return res.status(200).json(
+                new apiResponse(
+                    200,
+                    {
+                        email: emailNormalized,
+                        username: usernameNormalized,
+                        verificationPending: true,
+                        emailSent: true,
+                    },
+                    'Account created successfully. Please verify your email with the OTP sent to your inbox.'
+                )
+            );
         } catch (error) {
             logger.error('Signup verification email could not be sent for new pending registration:', {
                 message: error?.message,
                 code: error?.code,
             });
 
-            return res.status(202).json(
+            return res.status(200).json(
                 new apiResponse(
-                    202,
+                    200,
                     {
                         email: emailNormalized,
                         username: usernameNormalized,
                         verificationPending: true,
+                        emailSent: false,
                     },
-                    'Account saved. Verification email could not be delivered right now. Please try again from resend OTP.'
+                    'Account created successfully. Verification email could not be delivered. Please check your email or use "Resend OTP" to send it again.'
                 )
             );
         }

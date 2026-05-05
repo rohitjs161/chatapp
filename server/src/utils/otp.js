@@ -275,15 +275,20 @@ export const sendEmailVerification = async (email, otp) => {
     let transporter;
 
     try {
+        // Validate email configuration
         if (!getTrimmedEnv('EMAIL_SERVICE') && !getTrimmedEnv('SMTP_URL')) {
+            logger.error('❌ EMAIL_SERVICE not configured in .env');
             throw new apiError(500, 'Email service not configured. Please contact support.');
         }
 
+        // Get configured transporter
         transporter = getEmailTransporter();
 
+        // Verify connection
         if (process.env.NODE_ENV !== 'production') {
             try {
                 await transporter.verify();
+                logger.log('✅ Email service connected');
             } catch (verifyError) {
                 logger.error('❌ Email verification transport check failed:', {
                     message: verifyError.message,
@@ -298,9 +303,11 @@ export const sendEmailVerification = async (email, otp) => {
             logger.log('📧 Skipping SMTP verify in production; sending verification email directly');
         }
 
+        // Determine sender email
         const senderEmail = getDefaultSenderEmail();
         const senderName = getTrimmedEnv('EMAIL_FROM_NAME') || getTrimmedEnv('SENDGRID_FROM_NAME') || 'ChatApp Support';
 
+        // Email options
         const mailOptions = {
             from: `${senderName} <${senderEmail}>`,
             to: email,
@@ -309,33 +316,107 @@ export const sendEmailVerification = async (email, otp) => {
             html: getVerificationTemplate(otp),
         };
 
-        const result = await transporter.sendMail(mailOptions);
+        // Send email
+        try {
+            const result = await transporter.sendMail(mailOptions);
+            logger.log(`✅ Email sent successfully to ${email} | Message ID: ${result.messageId}`);
 
-        if (process.env.NODE_ENV === 'production') {
-            logEmailEvent({ email, action: 'email_verification_sent', status: 'success', messageId: result.messageId, service: process.env.EMAIL_SERVICE });
+            // Log for analytics (if using production service)
+            if (process.env.NODE_ENV === 'production') {
+                logEmailEvent({
+                    email,
+                    action: 'email_verification_sent',
+                    status: 'success',
+                    messageId: result.messageId,
+                    service: process.env.EMAIL_SERVICE,
+                });
+            }
+
+            return result;
+
+        } catch (sendError) {
+            logger.error('❌ Failed to send verification email:', {
+                message: sendError.message,
+                code: sendError.code,
+                response: sendError.response,
+                responseCode: sendError.responseCode,
+                command: sendError.command,
+            });
+
+            if (process.env.NODE_ENV === 'development') {
+                logger.error('📋 Full error details:', sendError);
+            }
+
+            throw new apiError(500, 'Failed to send verification email. Please try again later.');
         }
-
-        return result;
 
     } catch (error) {
+        logger.error('📧 Email verification error:', error.message);
+
+        // Log error for debugging
         if (process.env.NODE_ENV === 'production') {
-            logEmailEvent({ email, action: 'email_verification_failed', status: 'error', error: error.message, service: process.env.EMAIL_SERVICE });
+            logEmailEvent({
+                email,
+                action: 'email_verification_failed',
+                status: 'error',
+                error: error.message,
+                service: process.env.EMAIL_SERVICE,
+            });
         }
-        throw error instanceof apiError ? error : new apiError(500, 'Failed to send verification email. Please try again later.');
+
+        throw error instanceof apiError 
+            ? error 
+            : new apiError(500, 'Failed to send verification email. Please try again later.');
     }
 };
 
 const getVerificationTemplate = (otp) => `
     <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f5f7fa;">
-        <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; border-radius: 8px; color: white; text-align: center;">
-            <h1 style="margin:0;">Verify Your Email</h1>
+        <!-- Header -->
+        <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px 20px; border-radius: 8px 8px 0 0; text-align: center; color: white;">
+            <h1 style="margin: 0; font-size: 32px; font-weight: 700;">ChatApp</h1>
+            <p style="margin: 8px 0 0 0; font-size: 16px; opacity: 0.95;">Welcome to ChatApp</p>
         </div>
-        <div style="background: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.06);">
-            <p>Use the verification code below to confirm your new email address. This code will expire in 10 minutes.</p>
-            <div style="margin:24px 0; padding:18px; border-radius:8px; background:#f7f9fc; text-align:center; font-family: 'Courier New', monospace; font-size:28px;">
-                ${otp}
+
+        <!-- Body -->
+        <div style="background: white; padding: 40px 30px; border-radius: 0 0 8px 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+            <p style="color: #333; font-size: 16px; margin-bottom: 24px; line-height: 1.6;">
+                Hi there,
+            </p>
+
+            <p style="color: #666; font-size: 15px; line-height: 1.7; margin-bottom: 30px;">
+                Thank you for signing up! Use the One-Time Password (OTP) below to verify your email and activate your account. <strong>This code will expire in 10 minutes.</strong>
+            </p>
+
+            <!-- OTP Box -->
+            <div style="background: linear-gradient(135deg, #f5f7fa 0%, #e9ecef 100%); padding: 30px; border-radius: 8px; text-align: center; margin: 30px 0; border-left: 4px solid #667eea;">
+                <p style="color: #999; font-size: 12px; margin: 0 0 12px 0; text-transform: uppercase; letter-spacing: 2px; font-weight: 600;">Verification Code</p>
+                <p style="font-size: 44px; font-weight: bold; color: #667eea; letter-spacing: 12px; margin: 0; font-family: 'Courier New', 'Courier', monospace; font-weight: 700;">
+                    ${otp}
+                </p>
+                <p style="color: #aaa; font-size: 12px; margin: 12px 0 0 0;">⏰ Valid for 10 minutes</p>
             </div>
-            <p>If you did not request this change, please contact support immediately.</p>
+
+            <!-- Security Notice -->
+            <div style="background: #f0f8ff; border-left: 4px solid #667eea; padding: 16px; border-radius: 4px; margin: 25px 0;">
+                <p style="color: #333; font-size: 14px; margin: 0; line-height: 1.6;">
+                    <strong>🔒 Security Notice:</strong> Never share this OTP with anyone. ChatApp support will never ask for your OTP via email or phone.
+                </p>
+            </div>
+
+            <p style="color: #666; font-size: 14px; line-height: 1.7; margin-top: 25px;">
+                If you didn't create this account, please <strong>ignore this email</strong> and your data will not be activated.
+            </p>
+
+            <!-- Footer -->
+            <div style="margin-top: 35px; padding-top: 25px; border-top: 1px solid #e9ecef;">
+                <p style="color: #999; font-size: 13px; margin: 0 0 10px 0;">
+                    Need help? Contact us at <a href="mailto:support@yourdomain.com" style="color: #667eea; text-decoration: none;">support@yourdomain.com</a>
+                </p>
+                <p style="color: #aaa; font-size: 11px; margin: 10px 0 0 0; line-height: 1.5;">
+                    &copy; 2024 ChatApp. All rights reserved. | <a href="https://yourdomain.com/privacy" style="color: #667eea; text-decoration: none;">Privacy Policy</a> | <a href="https://yourdomain.com/terms" style="color: #667eea; text-decoration: none;">Terms of Service</a>
+                </p>
+            </div>
         </div>
     </div>
 `;
