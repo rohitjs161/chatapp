@@ -403,7 +403,27 @@ const registerUser = asyncHandler(async (req, res) => {
             pendingRegistration.otpResendAvailableAt = getNextResendAvailableAt();
             await pendingRegistration.save();
 
-            await sendEmailVerification(emailNormalized, verificationOTP);
+            try {
+                await sendEmailVerification(emailNormalized, verificationOTP);
+            } catch (error) {
+                logger.error('Signup verification email could not be sent for existing pending registration:', {
+                    message: error?.message,
+                    code: error?.code,
+                });
+
+                return res.status(202).json(
+                    new apiResponse(
+                        202,
+                        {
+                            email: emailNormalized,
+                            username: usernameNormalized,
+                            verificationPending: true,
+                            otpResent: false,
+                        },
+                        'Account saved. Verification email could not be delivered right now. Please try again from resend OTP.'
+                    )
+                );
+            }
 
             return res.status(200).json(
                 new apiResponse(
@@ -431,7 +451,26 @@ const registerUser = asyncHandler(async (req, res) => {
             otpResendAvailableAt: getNextResendAvailableAt(),
         });
 
-        await sendEmailVerification(emailNormalized, verificationOTP);
+        try {
+            await sendEmailVerification(emailNormalized, verificationOTP);
+        } catch (error) {
+            logger.error('Signup verification email could not be sent for new pending registration:', {
+                message: error?.message,
+                code: error?.code,
+            });
+
+            return res.status(202).json(
+                new apiResponse(
+                    202,
+                    {
+                        email: emailNormalized,
+                        username: usernameNormalized,
+                        verificationPending: true,
+                    },
+                    'Account saved. Verification email could not be delivered right now. Please try again from resend OTP.'
+                )
+            );
+        }
     } catch (error) {
         logger.error('Pending registration failed', {
             code: error?.code,
@@ -1524,7 +1563,16 @@ const resendOTP = asyncHandler(async (req, res) => {
             pendingRegistration.otpResendBlockedUntil = null;
             await pendingRegistration.save({ validateBeforeSave: false });
 
-            throw new apiError(500, 'Failed to send OTP email. Please try again later.');
+            return res.status(202).json(
+                new apiResponse(
+                    202,
+                    {
+                        email: pendingRegistration.email,
+                        verificationPending: true,
+                    },
+                    'Account is saved, but the verification email could not be delivered right now. Please request a new OTP again shortly.'
+                )
+            );
         }
     } else {
         // Password reset flow: keep existing behavior for reset-password OTP resend

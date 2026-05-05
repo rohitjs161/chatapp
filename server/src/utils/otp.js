@@ -40,12 +40,20 @@ const getEmailTransporter = () => {
     const smtpUrl = getTrimmedEnv('SMTP_URL');
     const emailService = getTrimmedEnv('EMAIL_SERVICE').toLowerCase() || 'gmail';
     const nodeEnv = process.env.NODE_ENV || 'development';
+    const transportTimeouts = {
+        connectionTimeout: 15000,
+        greetingTimeout: 15000,
+        socketTimeout: 20000,
+    };
 
     logger.log(`📧 Configuring email service: ${emailService} (${nodeEnv})`);
 
     try {
         if (smtpUrl) {
-            return nodemailer.createTransport(smtpUrl);
+            return nodemailer.createTransport({
+                url: smtpUrl,
+                ...transportTimeouts,
+            });
         }
 
         // SendGrid Configuration (Production Recommended)
@@ -60,6 +68,7 @@ const getEmailTransporter = () => {
                 host: 'smtp.sendgrid.net',
                 port: 587,
                 secure: false,
+                ...transportTimeouts,
                 auth: {
                     user: 'apikey',
                     pass: sendgridApiKey,
@@ -85,6 +94,7 @@ const getEmailTransporter = () => {
                     rejectUnauthorized: true,
                 },
                 family: 4,
+                ...transportTimeouts,
                 auth: {
                     user: emailUser,
                     pass: emailPassword,
@@ -105,6 +115,7 @@ const getEmailTransporter = () => {
                 host: 'smtp.mailgun.org',
                 port: 587,
                 secure: false,
+                ...transportTimeouts,
                 auth: {
                     user: `postmaster@${mailgunDomain}`,
                     pass: mailgunApiKey,
@@ -118,6 +129,7 @@ const getEmailTransporter = () => {
                 host: 'smtp.ethereal.email',
                 port: 587,
                 secure: false,
+                ...transportTimeouts,
                 auth: {
                     user: 'kade.howe@ethereal.email',
                     pass: 'm2xB7YgJnwsA8JtvkZ',
@@ -171,18 +183,22 @@ export const sendEmailOTP = async (email, otp) => {
         transporter = getEmailTransporter();
 
         // Verify connection
-        try {
-            await transporter.verify();
-            logger.log('✅ Email service connected');
-        } catch (verifyError) {
-            logger.error('❌ Email authentication failed:', {
-                message: verifyError.message,
-                code: verifyError.code,
-                response: verifyError.response,
-                responseCode: verifyError.responseCode,
-                command: verifyError.command,
-            });
-            throw new apiError(500, 'Email service authentication failed. Check configuration.');
+        if (process.env.NODE_ENV !== 'production') {
+            try {
+                await transporter.verify();
+                logger.log('✅ Email service connected');
+            } catch (verifyError) {
+                logger.error('❌ Email authentication failed:', {
+                    message: verifyError.message,
+                    code: verifyError.code,
+                    response: verifyError.response,
+                    responseCode: verifyError.responseCode,
+                    command: verifyError.command,
+                });
+                throw new apiError(500, 'Email service authentication failed. Check configuration.');
+            }
+        } else {
+            logger.log('📧 Skipping SMTP verify in production; sending directly');
         }
 
         // Determine sender email
@@ -265,17 +281,21 @@ export const sendEmailVerification = async (email, otp) => {
 
         transporter = getEmailTransporter();
 
-        try {
-            await transporter.verify();
-        } catch (verifyError) {
-            logger.error('❌ Email verification transport check failed:', {
-                message: verifyError.message,
-                code: verifyError.code,
-                response: verifyError.response,
-                responseCode: verifyError.responseCode,
-                command: verifyError.command,
-            });
-            throw new apiError(500, 'Email service authentication failed. Check configuration.');
+        if (process.env.NODE_ENV !== 'production') {
+            try {
+                await transporter.verify();
+            } catch (verifyError) {
+                logger.error('❌ Email verification transport check failed:', {
+                    message: verifyError.message,
+                    code: verifyError.code,
+                    response: verifyError.response,
+                    responseCode: verifyError.responseCode,
+                    command: verifyError.command,
+                });
+                throw new apiError(500, 'Email service authentication failed. Check configuration.');
+            }
+        } else {
+            logger.log('📧 Skipping SMTP verify in production; sending verification email directly');
         }
 
         const senderEmail = getDefaultSenderEmail();
