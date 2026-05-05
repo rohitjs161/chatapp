@@ -1573,7 +1573,26 @@ const resendOTP = asyncHandler(async (req, res) => {
 
         try {
             await sendEmailVerification(pendingRegistration.email, otp);
+            logger.log('✅ Resend OTP email sent successfully');
+            
+            return res.status(200).json(
+                new apiResponse(
+                    200,
+                    {
+                        email: pendingRegistration.email,
+                        otpResent: true,
+                        emailSent: true,
+                    },
+                    'A new OTP has been sent to your email. Please check your inbox.'
+                )
+            );
         } catch (error) {
+            logger.error('❌ Resend OTP email could not be sent:', {
+                message: error?.message,
+                code: error?.code,
+            });
+            
+            // Save the failed state
             pendingRegistration.emailVerificationOTP = null;
             pendingRegistration.emailVerificationOTPExpiry = null;
             pendingRegistration.otpResendAvailableAt = null;
@@ -1581,14 +1600,15 @@ const resendOTP = asyncHandler(async (req, res) => {
             pendingRegistration.otpResendBlockedUntil = null;
             await pendingRegistration.save({ validateBeforeSave: false });
 
-            return res.status(202).json(
+            return res.status(200).json(
                 new apiResponse(
-                    202,
+                    200,
                     {
                         email: pendingRegistration.email,
                         verificationPending: true,
+                        emailSent: false,
                     },
-                    'Account is saved, but the verification email could not be delivered right now. Please request a new OTP again shortly.'
+                    'The verification email could not be delivered. Please check your email or try again in a moment.'
                 )
             );
         }

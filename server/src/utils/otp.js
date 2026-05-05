@@ -41,15 +41,17 @@ const getEmailTransporter = () => {
     const emailService = getTrimmedEnv('EMAIL_SERVICE').toLowerCase() || 'gmail';
     const nodeEnv = process.env.NODE_ENV || 'development';
     const transportTimeouts = {
-        connectionTimeout: 15000,
-        greetingTimeout: 15000,
-        socketTimeout: 20000,
+        connectionTimeout: 20000,
+        greetingTimeout: 20000,
+        socketTimeout: 30000,
     };
 
     logger.log(`📧 Configuring email service: ${emailService} (${nodeEnv})`);
+    logger.log(`📧 Timeouts - Connection: ${transportTimeouts.connectionTimeout}ms, Greeting: ${transportTimeouts.greetingTimeout}ms, Socket: ${transportTimeouts.socketTimeout}ms`);
 
     try {
         if (smtpUrl) {
+            logger.log('📧 Using SMTP_URL from environment');
             return nodemailer.createTransport({
                 url: smtpUrl,
                 ...transportTimeouts,
@@ -64,6 +66,7 @@ const getEmailTransporter = () => {
                 throw new Error('SENDGRID_API_KEY not found in .env');
             }
 
+            logger.log('📧 Using SendGrid configuration');
             return nodemailer.createTransport({
                 host: 'smtp.sendgrid.net',
                 port: 587,
@@ -82,9 +85,16 @@ const getEmailTransporter = () => {
             const emailPassword = getTrimmedEnv('EMAIL_PASSWORD');
 
             if (!emailUser || !emailPassword) {
-                throw new Error('EMAIL_USER or EMAIL_PASSWORD not found in .env');
+                const missingFields = [];
+                if (!emailUser) missingFields.push('EMAIL_USER');
+                if (!emailPassword) missingFields.push('EMAIL_PASSWORD');
+                throw new Error(`Missing Gmail config: ${missingFields.join(', ')}`);
             }
 
+            logger.log(`📧 Using Gmail configuration - User: ${emailUser}`);
+            logger.log(`📧 Gmail SMTP: smtp.gmail.com:587 (TLS required, IPv4 only)`);
+            logger.log(`📧 Note: Gmail requires an App Password (not your main password). Generate one at: https://myaccount.google.com/apppasswords`);
+            
             return nodemailer.createTransport({
                 host: 'smtp.gmail.com',
                 port: 587,
@@ -92,8 +102,9 @@ const getEmailTransporter = () => {
                 requireTLS: true,
                 tls: {
                     rejectUnauthorized: true,
+                    minVersion: 'TLSv1.2',
                 },
-                family: 4,
+                family: 4,  // 🔧 IMPORTANT: Force IPv4 only (fixes ENETUNREACH errors)
                 ...transportTimeouts,
                 auth: {
                     user: emailUser,
@@ -111,10 +122,12 @@ const getEmailTransporter = () => {
                 throw new Error('MAILGUN_API_KEY or MAILGUN_DOMAIN not found in .env');
             }
 
+            logger.log(`📧 Using Mailgun configuration - Domain: ${mailgunDomain}`);
             return nodemailer.createTransport({
                 host: 'smtp.mailgun.org',
                 port: 587,
                 secure: false,
+                family: 4,  // Force IPv4 only
                 ...transportTimeouts,
                 auth: {
                     user: `postmaster@${mailgunDomain}`,
@@ -125,10 +138,12 @@ const getEmailTransporter = () => {
 
         // Ethereal Configuration (Testing Only)
         if (emailService === 'ethereal') {
+            logger.log('📧 Using Ethereal test email service (development/testing only)');
             return nodemailer.createTransport({
                 host: 'smtp.ethereal.email',
                 port: 587,
                 secure: false,
+                family: 4,  // Force IPv4 only
                 ...transportTimeouts,
                 auth: {
                     user: 'kade.howe@ethereal.email',
@@ -167,8 +182,40 @@ export const compareOTP = (inputOTP, storedHashedOTP) => {
 };
 
 // ============================================
-// SEND EMAIL OTP
+// SEND EMAIL WITH RETRY LOGIC
 // ============================================
+const sendEmailWithRetry = async (transporter, mailOptions, maxRetries = 3) => {
+    let lastError;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            logger.log(`📧 Attempt ${attempt}/${maxRetries} to send email to: ${mailOptions.to}`);
+            const result = await transporter.sendMail(mailOptions);
+            return result;
+        } catch (error) {
+            lastError = error;
+            const isNetworkError = error.code === 'ENETUNREACH' || 
+                                   error.code === 'ESOCKET' ||
+                                   error.code === 'ETIMEDOUT' ||
+                                   error.code === 'ECONNREFUSED' ||
+                                   error.code === 'EHOSTUNREACH';
+            
+            if (isNetworkError && attempt < maxRetries) {
+                const delayMs = Math.min(1000 * Math.pow(2, attempt - 1), 5000); // Exponential backoff
+                logger.warn(`⚠️ Network error on attempt ${attempt}, retrying in ${delayMs}ms...`, {
+                    code: error.code,
+                    message: error.message,
+                });
+                await new Promise(resolve => setTimeout(resolve, delayMs));
+            } else {
+                // Not a network error or last attempt
+                throw error;
+            }
+        }
+    }
+    
+    throw lastError;
+};
 export const sendEmailOTP = async (email, otp) => {
     let transporter;
 
@@ -216,7 +263,7 @@ export const sendEmailOTP = async (email, otp) => {
 
         // Send email
         try {
-            const result = await transporter.sendMail(mailOptions);
+            const result = await sendEmailWithRetry(transporter, mailOptions);
             logger.log(`✅ Email sent successfully to ${email} | Message ID: ${result.messageId}`);
 
             // Log for analytics (if using production service)
@@ -287,20 +334,46 @@ export const sendEmailVerification = async (email, otp) => {
         // Verify connection
         if (process.env.NODE_ENV !== 'production') {
             try {
+                logger.log('📧 Testing SMTP connection (verify step)...');
                 await transporter.verify();
-                logger.log('✅ Email service connected');
+                logger.log('✅ Email service connected and authenticated successfully');
             } catch (verifyError) {
-                logger.error('❌ Email verification transport check failed:', {
+                const verifyErrorInfo = {
                     message: verifyError.message,
                     code: verifyError.code,
                     response: verifyError.response,
                     responseCode: verifyError.responseCode,
                     command: verifyError.command,
-                });
+                    errno: verifyError.errno,
+                    syscall: verifyError.syscall,
+                };
+                
+                logger.error('❌ Email service verification failed:', verifyErrorInfo);
+
+                // Helpful hints for common issues
+                if (verifyError.code === 'ECONNREFUSED' || verifyError.errno === 'ECONNREFUSED') {
+                    logger.error('💡 Cannot connect to SMTP server. Check:');
+                    logger.error('   - SMTP host is correct (smtp.gmail.com for Gmail)');
+                    logger.error('   - SMTP port is correct (587 for TLS)');
+                    logger.error('   - Network/firewall allows outbound SMTP connections');
+                } else if (verifyError.code === 535 || verifyError.message.includes('Invalid login')) {
+                    logger.error('💡 Authentication failed. For Gmail:');
+                    logger.error('   - Use an App Password (not your main password)');
+                    logger.error('   - Get it from: https://myaccount.google.com/apppasswords');
+                    logger.error('   - Enable 2-Factor Authentication first if you haven\'t');
+                    logger.error('   - Check that EMAIL_USER and EMAIL_PASSWORD are correct in .env');
+                } else if (verifyError.code === 'ENOTFOUND' || verifyError.errno === 'ENOTFOUND') {
+                    logger.error('💡 Cannot find SMTP server. Check EMAIL_SERVICE setting.');
+                }
+
+                if (process.env.NODE_ENV === 'development') {
+                    logger.error('📋 Full verification error:', verifyError);
+                }
+                
                 throw new apiError(500, 'Email service authentication failed. Check configuration.');
             }
         } else {
-            logger.log('📧 Skipping SMTP verify in production; sending verification email directly');
+            logger.log('📧 Production mode: Skipping SMTP verify; sending verification email directly');
         }
 
         // Determine sender email
@@ -318,7 +391,10 @@ export const sendEmailVerification = async (email, otp) => {
 
         // Send email
         try {
-            const result = await transporter.sendMail(mailOptions);
+            logger.log(`📧 Attempting to send verification email to: ${email}`);
+            logger.log(`📧 From: ${senderName} <${senderEmail}>`);
+            
+            const result = await sendEmailWithRetry(transporter, mailOptions);
             logger.log(`✅ Email sent successfully to ${email} | Message ID: ${result.messageId}`);
 
             // Log for analytics (if using production service)
@@ -335,16 +411,39 @@ export const sendEmailVerification = async (email, otp) => {
             return result;
 
         } catch (sendError) {
-            logger.error('❌ Failed to send verification email:', {
+            // Detailed error logging
+            const errorInfo = {
                 message: sendError.message,
                 code: sendError.code,
                 response: sendError.response,
                 responseCode: sendError.responseCode,
                 command: sendError.command,
-            });
+                errno: sendError.errno,
+                syscall: sendError.syscall,
+                hostname: sendError.hostname,
+            };
+            
+            logger.error('❌ Failed to send verification email:', errorInfo);
+
+            // Provide helpful hints based on error type
+            if (sendError.code === 'ECONNREFUSED') {
+                logger.error('💡 Connection refused - SMTP server might be down or wrong port');
+                        } else if (sendError.code === 'ENETUNREACH' || sendError.code === 'ESOCKET') {
+                            logger.error('💡 Network unreachable - IPv6 issue or network connectivity problem');
+                            logger.error('💡 Solution: Check your internet connection or contact your ISP');
+            } else if (sendError.code === 'ENOTFOUND') {
+                logger.error('💡 Server not found - check SMTP hostname');
+            } else if (sendError.code === 'ETIMEDOUT' || sendError.code === 'ESOCKETTIMEDOUT') {
+                logger.error('💡 Connection timeout - SMTP server not responding or network issue');
+            } else if (sendError.code === 535) {
+                logger.error('💡 Authentication failed - check EMAIL_USER and EMAIL_PASSWORD');
+                logger.error('💡 For Gmail: Use App Password from https://myaccount.google.com/apppasswords');
+            } else if (sendError.message.includes('Invalid login') || sendError.message.includes('User')) {
+                logger.error('💡 Gmail authentication failed - check if using App Password (not main password)');
+            }
 
             if (process.env.NODE_ENV === 'development') {
-                logger.error('📋 Full error details:', sendError);
+                logger.error('📋 Full error stack:', sendError);
             }
 
             throw new apiError(500, 'Failed to send verification email. Please try again later.');
@@ -492,4 +591,72 @@ const logEmailEvent = (eventData) => {
 
     // TODO: Send to analytics service (DataDog, Mixpanel, etc.)
     // TODO: Store in database for monitoring
+};
+
+// ============================================
+// DIAGNOSTIC FUNCTION - Test Email Configuration
+// ============================================
+export const testEmailConfiguration = async () => {
+    console.log('\n🧪 Testing Email Configuration...\n');
+    
+    try {
+        const emailService = getTrimmedEnv('EMAIL_SERVICE').toLowerCase() || 'gmail';
+        const emailUser = getTrimmedEnv('EMAIL_USER');
+        
+        console.log(`📧 Email Service: ${emailService}`);
+        console.log(`📧 Email User: ${emailUser || '(not configured)'}`);
+        console.log(`📧 Node Environment: ${process.env.NODE_ENV || 'development'}`);
+        
+        // Test configuration
+        if (!emailService && !getTrimmedEnv('SMTP_URL')) {
+            console.error('\n❌ ERROR: EMAIL_SERVICE or SMTP_URL not configured in .env');
+            return false;
+        }
+        
+        console.log('\n🔗 Creating transporter...');
+        const transporter = getEmailTransporter();
+        console.log('✅ Transporter created');
+        
+        console.log('\n🔑 Verifying SMTP connection...');
+        await transporter.verify();
+        console.log('✅ SMTP connection verified and authenticated successfully!');
+        
+        console.log('\n📤 Sending test email...');
+        const result = await transporter.sendMail({
+            from: `ChatApp <${emailUser}>`,
+            to: emailUser,
+            subject: 'ChatApp - Email Configuration Test',
+            html: '<h1>✅ Email Configuration Works!</h1><p>You can now use ChatApp email features.</p>',
+        });
+        console.log(`✅ Test email sent! Message ID: ${result.messageId}`);
+        
+        console.log('\n🎉 Email configuration is working correctly!\n');
+        return true;
+        
+    } catch (error) {
+        console.error('\n❌ Email configuration test failed!');
+        console.error(`Error: ${error.message}\n`);
+        
+        if (error.code === 'ECONNREFUSED') {
+            console.error('💡 Cannot connect to SMTP server. Possible causes:');
+            console.error('   - SMTP server is down');
+            console.error('   - Wrong SMTP host or port');
+            console.error('   - Network/firewall blocking connection');
+        } else if (error.code === 535 || error.message.includes('Invalid login')) {
+            console.error('💡 Authentication failed. For Gmail:');
+            console.error('   - Use an App Password from: https://myaccount.google.com/apppasswords');
+            console.error('   - NOT your main Gmail password');
+            console.error('   - Make sure 2-Factor Authentication is enabled first');
+        } else if (error.code === 'ENOTFOUND') {
+            console.error('💡 Cannot find SMTP server (DNS issue or wrong host)');
+        } else if (error.code === 'ETIMEDOUT') {
+            console.error('💡 Connection timeout. Firewall or network issue blocking SMTP port 587');
+        }
+        
+        console.error('\nDebugging info:');
+        console.error(`Code: ${error.code}`);
+        console.error(`Message: ${error.message}`);
+        
+        return false;
+    }
 };
