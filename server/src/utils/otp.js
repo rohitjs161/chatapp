@@ -3,19 +3,56 @@ import nodemailer from 'nodemailer';
 import { apiError } from './apiError.js';
 import { logger } from "./logger.js";
 
+const getTrimmedEnv = (name) => {
+    const value = process.env[name];
+
+    if (typeof value !== 'string') {
+        return '';
+    }
+
+    return value.trim();
+};
+
+const getSmtpUsername = (smtpUrl) => {
+    if (!smtpUrl) {
+        return '';
+    }
+
+    try {
+        const parsedUrl = new URL(smtpUrl);
+        return decodeURIComponent(parsedUrl.username || '').trim();
+    } catch {
+        return '';
+    }
+};
+
+const getDefaultSenderEmail = () => {
+    return getTrimmedEnv('SENDGRID_FROM_EMAIL')
+        || getTrimmedEnv('EMAIL_FROM')
+        || getSmtpUsername(getTrimmedEnv('SMTP_URL'))
+        || getTrimmedEnv('EMAIL_USER');
+};
+
 // ============================================
 // CONFIGURE TRANSPORTER BASED ON ENVIRONMENT
 // ============================================
 const getEmailTransporter = () => {
-    const emailService = process.env.EMAIL_SERVICE || 'gmail';
+    const smtpUrl = getTrimmedEnv('SMTP_URL');
+    const emailService = getTrimmedEnv('EMAIL_SERVICE').toLowerCase() || 'gmail';
     const nodeEnv = process.env.NODE_ENV || 'development';
 
     logger.log(`📧 Configuring email service: ${emailService} (${nodeEnv})`);
 
     try {
+        if (smtpUrl) {
+            return nodemailer.createTransport(smtpUrl);
+        }
+
         // SendGrid Configuration (Production Recommended)
         if (emailService === 'sendgrid') {
-            if (!process.env.SENDGRID_API_KEY) {
+            const sendgridApiKey = getTrimmedEnv('SENDGRID_API_KEY');
+
+            if (!sendgridApiKey) {
                 throw new Error('SENDGRID_API_KEY not found in .env');
             }
 
@@ -25,29 +62,37 @@ const getEmailTransporter = () => {
                 secure: false,
                 auth: {
                     user: 'apikey',
-                    pass: process.env.SENDGRID_API_KEY,
+                    pass: sendgridApiKey,
                 },
             });
         }
 
         // Gmail Configuration (Small Scale / Development)
         if (emailService === 'gmail') {
-            if (!process.env.EMAIL_USER || !process.env.EMAIL_PASSWORD) {
+            const emailUser = getTrimmedEnv('EMAIL_USER');
+            const emailPassword = getTrimmedEnv('EMAIL_PASSWORD');
+
+            if (!emailUser || !emailPassword) {
                 throw new Error('EMAIL_USER or EMAIL_PASSWORD not found in .env');
             }
 
             return nodemailer.createTransport({
-                service: 'gmail',
+                host: 'smtp.gmail.com',
+                port: 465,
+                secure: true,
                 auth: {
-                    user: process.env.EMAIL_USER,
-                    pass: process.env.EMAIL_PASSWORD,
+                    user: emailUser,
+                    pass: emailPassword,
                 },
             });
         }
 
         // Mailgun Configuration
         if (emailService === 'mailgun') {
-            if (!process.env.MAILGUN_API_KEY || !process.env.MAILGUN_DOMAIN) {
+            const mailgunApiKey = getTrimmedEnv('MAILGUN_API_KEY');
+            const mailgunDomain = getTrimmedEnv('MAILGUN_DOMAIN');
+
+            if (!mailgunApiKey || !mailgunDomain) {
                 throw new Error('MAILGUN_API_KEY or MAILGUN_DOMAIN not found in .env');
             }
 
@@ -56,8 +101,8 @@ const getEmailTransporter = () => {
                 port: 587,
                 secure: false,
                 auth: {
-                    user: `postmaster@${process.env.MAILGUN_DOMAIN}`,
-                    pass: process.env.MAILGUN_API_KEY,
+                    user: `postmaster@${mailgunDomain}`,
+                    pass: mailgunApiKey,
                 },
             });
         }
@@ -112,7 +157,7 @@ export const sendEmailOTP = async (email, otp) => {
 
     try {
         // Validate email configuration
-        if (!process.env.EMAIL_SERVICE) {
+        if (!getTrimmedEnv('EMAIL_SERVICE') && !getTrimmedEnv('SMTP_URL')) {
             logger.error('❌ EMAIL_SERVICE not configured in .env');
             throw new apiError(500, 'Email service not configured. Please contact support.');
         }
@@ -125,20 +170,26 @@ export const sendEmailOTP = async (email, otp) => {
             await transporter.verify();
             logger.log('✅ Email service connected');
         } catch (verifyError) {
-            logger.error('❌ Email authentication failed:', verifyError.message);
+            logger.error('❌ Email authentication failed:', {
+                message: verifyError.message,
+                code: verifyError.code,
+                response: verifyError.response,
+                responseCode: verifyError.responseCode,
+                command: verifyError.command,
+            });
             throw new apiError(500, 'Email service authentication failed. Check configuration.');
         }
 
         // Determine sender email
-        const senderEmail = process.env.SENDGRID_FROM_EMAIL || process.env.EMAIL_USER;
-        const senderName = process.env.SENDGRID_FROM_NAME || 'ChatApp Support';
+        const senderEmail = getDefaultSenderEmail();
+        const senderName = getTrimmedEnv('SENDGRID_FROM_NAME') || 'ChatApp Support';
 
         // Email options
         const mailOptions = {
             from: `${senderName} <${senderEmail}>`,
             to: email,
-            subject: process.env.EMAIL_SUBJECT_FORGOT_PASSWORD || 'Reset Your Password - ChatApp',
-            replyTo: process.env.EMAIL_REPLY_TO || senderEmail,
+            subject: getTrimmedEnv('EMAIL_SUBJECT_FORGOT_PASSWORD') || 'Reset Your Password - ChatApp',
+            replyTo: getTrimmedEnv('EMAIL_REPLY_TO') || senderEmail,
             html: getEmailTemplate(otp),
         };
 
@@ -161,7 +212,13 @@ export const sendEmailOTP = async (email, otp) => {
             return result;
 
         } catch (sendError) {
-            logger.error('❌ Failed to send email:', sendError.message);
+            logger.error('❌ Failed to send email:', {
+                message: sendError.message,
+                code: sendError.code,
+                response: sendError.response,
+                responseCode: sendError.responseCode,
+                command: sendError.command,
+            });
 
             if (process.env.NODE_ENV === 'development') {
                 logger.error('📋 Full error details:', sendError);
@@ -197,7 +254,7 @@ export const sendEmailVerification = async (email, otp) => {
     let transporter;
 
     try {
-        if (!process.env.EMAIL_SERVICE) {
+        if (!getTrimmedEnv('EMAIL_SERVICE') && !getTrimmedEnv('SMTP_URL')) {
             throw new apiError(500, 'Email service not configured. Please contact support.');
         }
 
@@ -206,17 +263,24 @@ export const sendEmailVerification = async (email, otp) => {
         try {
             await transporter.verify();
         } catch (verifyError) {
+            logger.error('❌ Email verification transport check failed:', {
+                message: verifyError.message,
+                code: verifyError.code,
+                response: verifyError.response,
+                responseCode: verifyError.responseCode,
+                command: verifyError.command,
+            });
             throw new apiError(500, 'Email service authentication failed. Check configuration.');
         }
 
-        const senderEmail = process.env.SENDGRID_FROM_EMAIL || process.env.EMAIL_USER;
-        const senderName = process.env.SENDGRID_FROM_NAME || 'ChatApp Support';
+        const senderEmail = getDefaultSenderEmail();
+        const senderName = getTrimmedEnv('SENDGRID_FROM_NAME') || 'ChatApp Support';
 
         const mailOptions = {
             from: `${senderName} <${senderEmail}>`,
             to: email,
-            subject: process.env.EMAIL_SUBJECT_VERIFY_EMAIL || 'Verify Your Email - ChatApp',
-            replyTo: process.env.EMAIL_REPLY_TO || senderEmail,
+            subject: getTrimmedEnv('EMAIL_SUBJECT_VERIFY_EMAIL') || 'Verify Your Email - ChatApp',
+            replyTo: getTrimmedEnv('EMAIL_REPLY_TO') || senderEmail,
             html: getVerificationTemplate(otp),
         };
 
