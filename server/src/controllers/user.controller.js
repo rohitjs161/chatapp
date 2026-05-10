@@ -1591,14 +1591,6 @@ const resendOTP = asyncHandler(async (req, res) => {
                 message: error?.message,
                 code: error?.code,
             });
-            
-            // Save the failed state
-            pendingRegistration.emailVerificationOTP = null;
-            pendingRegistration.emailVerificationOTPExpiry = null;
-            pendingRegistration.otpResendAvailableAt = null;
-            pendingRegistration.otpResendAttempts = 0;
-            pendingRegistration.otpResendBlockedUntil = null;
-            await pendingRegistration.save({ validateBeforeSave: false });
 
             return res.status(200).json(
                 new apiResponse(
@@ -2192,12 +2184,22 @@ const resendEmailChange = asyncHandler(async (req, res) => {
     try {
         await sendEmailVerification(user.pendingEmail, otp);
     } catch (err) {
-        user.emailOtp = null;
-        user.emailOtpExpiry = null;
-        user.emailOtpResendAvailableAt = null;
-        user.emailVerificationAttempts = 0;
-        await user.save({ validateBeforeSave: false });
-        throw new apiError(500, 'Failed to resend verification email. Please try again later.');
+        logger.error('Failed to resend email-change verification email:', {
+            message: err?.message,
+            code: err?.code,
+        });
+
+        return res.status(200).json(
+            new apiResponse(
+                200,
+                {
+                    email: user.pendingEmail,
+                    verificationPending: true,
+                    emailSent: false,
+                },
+                'The verification email could not be delivered. Please try "Resend OTP" again in a moment.'
+            )
+        );
     }
 
     return res.status(200).json(

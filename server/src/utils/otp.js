@@ -33,18 +33,38 @@ const getDefaultSenderEmail = () => {
         || getTrimmedEnv('EMAIL_USER');
 };
 
+const parsePositiveInt = (value, fallbackValue) => {
+    const parsed = Number.parseInt(String(value || '').trim(), 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackValue;
+};
+
+const isTransientEmailError = (error = {}) => {
+    const code = String(error?.code || '').toUpperCase();
+    return [
+        'ENETUNREACH',
+        'ESOCKET',
+        'ETIMEDOUT',
+        'ESOCKETTIMEDOUT',
+        'ECONNREFUSED',
+        'EHOSTUNREACH',
+        'EAI_AGAIN',
+    ].includes(code);
+};
+
 // ============================================
 // CONFIGURE TRANSPORTER BASED ON ENVIRONMENT
 // ============================================
-const getEmailTransporter = () => {
+const getEmailTransporterCandidates = () => {
     const smtpUrl = getTrimmedEnv('SMTP_URL');
     const emailService = getTrimmedEnv('EMAIL_SERVICE').toLowerCase() || 'gmail';
     const nodeEnv = process.env.NODE_ENV || 'development';
+    const isProduction = nodeEnv === 'production';
     const transportTimeouts = {
-        connectionTimeout: 20000,
-        greetingTimeout: 20000,
-        socketTimeout: 30000,
+        connectionTimeout: parsePositiveInt(process.env.EMAIL_CONNECTION_TIMEOUT_MS, isProduction ? 30000 : 20000),
+        greetingTimeout: parsePositiveInt(process.env.EMAIL_GREETING_TIMEOUT_MS, isProduction ? 30000 : 20000),
+        socketTimeout: parsePositiveInt(process.env.EMAIL_SOCKET_TIMEOUT_MS, isProduction ? 45000 : 30000),
     };
+    const transporters = [];
 
     logger.log(`📧 Configuring email service: ${emailService} (${nodeEnv})`);
     logger.log(`📧 Timeouts - Connection: ${transportTimeouts.connectionTimeout}ms, Greeting: ${transportTimeouts.greetingTimeout}ms, Socket: ${transportTimeouts.socketTimeout}ms`);
@@ -52,10 +72,15 @@ const getEmailTransporter = () => {
     try {
         if (smtpUrl) {
             logger.log('📧 Using SMTP_URL from environment');
-            return nodemailer.createTransport({
-                url: smtpUrl,
-                ...transportTimeouts,
+            transporters.push({
+                name: 'smtp_url',
+                transporter: nodemailer.createTransport({
+                    url: smtpUrl,
+                    ...transportTimeouts,
+                }),
             });
+
+            return transporters;
         }
 
         // SendGrid Configuration (Production Recommended)
@@ -67,22 +92,29 @@ const getEmailTransporter = () => {
             }
 
             logger.log('📧 Using SendGrid configuration');
-            return nodemailer.createTransport({
-                host: 'smtp.sendgrid.net',
-                port: 587,
-                secure: false,
-                ...transportTimeouts,
-                auth: {
-                    user: 'apikey',
-                    pass: sendgridApiKey,
-                },
+            transporters.push({
+                name: 'sendgrid_587',
+                transporter: nodemailer.createTransport({
+                    host: 'smtp.sendgrid.net',
+                    port: 587,
+                    secure: false,
+                    family: 4,
+                    ...transportTimeouts,
+                    auth: {
+                        user: 'apikey',
+                        pass: sendgridApiKey,
+                    },
+                }),
             });
+
+            return transporters;
         }
 
         // Gmail Configuration (Small Scale / Development)
         if (emailService === 'gmail') {
             const emailUser = getTrimmedEnv('EMAIL_USER');
-            const emailPassword = getTrimmedEnv('EMAIL_PASSWORD');
+            const emailPassword = getTrimmedEnv('EMAIL_PASSWORD').replace(/\s+/g, '');
+            const explicitPort = parsePositiveInt(process.env.EMAIL_PORT, 0);
 
             if (!emailUser || !emailPassword) {
                 const missingFields = [];
@@ -92,25 +124,53 @@ const getEmailTransporter = () => {
             }
 
             logger.log(`📧 Using Gmail configuration - User: ${emailUser}`);
-            logger.log(`📧 Gmail SMTP: smtp.gmail.com:587 (TLS required, IPv4 only)`);
+            logger.log(`📧 Gmail SMTP: smtp.gmail.com (port fallback: 587 -> 465, IPv4 only)`);
             logger.log(`📧 Note: Gmail requires an App Password (not your main password). Generate one at: https://myaccount.google.com/apppasswords`);
-            
-            return nodemailer.createTransport({
-                host: 'smtp.gmail.com',
-                port: 587,
-                secure: false,
-                requireTLS: true,
-                tls: {
-                    rejectUnauthorized: true,
-                    minVersion: 'TLSv1.2',
-                },
-                family: 4,  // 🔧 IMPORTANT: Force IPv4 only (fixes ENETUNREACH errors)
-                ...transportTimeouts,
-                auth: {
-                    user: emailUser,
-                    pass: emailPassword,
-                },
-            });
+            const gmailAuth = {
+                user: emailUser,
+                pass: emailPassword,
+            };
+
+            const buildGmailTransport = (port) => {
+                const isImplicitTls = Number(port) === 465;
+                return nodemailer.createTransport({
+                    host: 'smtp.gmail.com',
+                    port,
+                    secure: isImplicitTls,
+                    requireTLS: !isImplicitTls,
+                    tls: {
+                        rejectUnauthorized: true,
+                        minVersion: 'TLSv1.2',
+                        servername: 'smtp.gmail.com',
+                    },
+                    family: 4,
+                    ...transportTimeouts,
+                    auth: gmailAuth,
+                });
+            };
+
+            if (explicitPort > 0) {
+                transporters.push({
+                    name: `gmail_${explicitPort}`,
+                    transporter: buildGmailTransport(explicitPort),
+                });
+            }
+
+            if (!explicitPort || explicitPort !== 587) {
+                transporters.push({
+                    name: 'gmail_587',
+                    transporter: buildGmailTransport(587),
+                });
+            }
+
+            if (!explicitPort || explicitPort !== 465) {
+                transporters.push({
+                    name: 'gmail_465',
+                    transporter: buildGmailTransport(465),
+                });
+            }
+
+            return transporters;
         }
 
         // Mailgun Configuration
@@ -123,33 +183,43 @@ const getEmailTransporter = () => {
             }
 
             logger.log(`📧 Using Mailgun configuration - Domain: ${mailgunDomain}`);
-            return nodemailer.createTransport({
-                host: 'smtp.mailgun.org',
-                port: 587,
-                secure: false,
-                family: 4,  // Force IPv4 only
-                ...transportTimeouts,
-                auth: {
-                    user: `postmaster@${mailgunDomain}`,
-                    pass: mailgunApiKey,
-                },
+            transporters.push({
+                name: 'mailgun_587',
+                transporter: nodemailer.createTransport({
+                    host: 'smtp.mailgun.org',
+                    port: 587,
+                    secure: false,
+                    family: 4,
+                    ...transportTimeouts,
+                    auth: {
+                        user: `postmaster@${mailgunDomain}`,
+                        pass: mailgunApiKey,
+                    },
+                }),
             });
+
+            return transporters;
         }
 
         // Ethereal Configuration (Testing Only)
         if (emailService === 'ethereal') {
             logger.log('📧 Using Ethereal test email service (development/testing only)');
-            return nodemailer.createTransport({
-                host: 'smtp.ethereal.email',
-                port: 587,
-                secure: false,
-                family: 4,  // Force IPv4 only
-                ...transportTimeouts,
-                auth: {
-                    user: 'kade.howe@ethereal.email',
-                    pass: 'm2xB7YgJnwsA8JtvkZ',
-                },
+            transporters.push({
+                name: 'ethereal_587',
+                transporter: nodemailer.createTransport({
+                    host: 'smtp.ethereal.email',
+                    port: 587,
+                    secure: false,
+                    family: 4,
+                    ...transportTimeouts,
+                    auth: {
+                        user: 'kade.howe@ethereal.email',
+                        pass: 'm2xB7YgJnwsA8JtvkZ',
+                    },
+                }),
             });
+
+            return transporters;
         }
 
         throw new Error(`Unsupported email service: ${emailService}`);
@@ -157,6 +227,15 @@ const getEmailTransporter = () => {
         logger.error('❌ Email transporter configuration error:', error.message);
         throw error;
     }
+};
+
+const getEmailTransporter = () => {
+    const candidates = getEmailTransporterCandidates();
+    if (!candidates.length) {
+        throw new Error('No configured email transporters available');
+    }
+
+    return candidates[0].transporter;
 };
 
 // ============================================
@@ -184,31 +263,51 @@ export const compareOTP = (inputOTP, storedHashedOTP) => {
 // ============================================
 // SEND EMAIL WITH RETRY LOGIC
 // ============================================
-const sendEmailWithRetry = async (transporter, mailOptions, maxRetries = 3) => {
+const sendEmailWithRetry = async (transporterCandidates, mailOptions, maxRetries = 3) => {
     let lastError;
-    
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-            logger.log(`📧 Attempt ${attempt}/${maxRetries} to send email to: ${mailOptions.to}`);
-            const result = await transporter.sendMail(mailOptions);
-            return result;
-        } catch (error) {
-            lastError = error;
-            const isNetworkError = error.code === 'ENETUNREACH' || 
-                                   error.code === 'ESOCKET' ||
-                                   error.code === 'ETIMEDOUT' ||
-                                   error.code === 'ECONNREFUSED' ||
-                                   error.code === 'EHOSTUNREACH';
-            
-            if (isNetworkError && attempt < maxRetries) {
-                const delayMs = Math.min(1000 * Math.pow(2, attempt - 1), 5000); // Exponential backoff
-                logger.warn(`⚠️ Network error on attempt ${attempt}, retrying in ${delayMs}ms...`, {
-                    code: error.code,
-                    message: error.message,
-                });
-                await new Promise(resolve => setTimeout(resolve, delayMs));
-            } else {
-                // Not a network error or last attempt
+    const candidates = Array.isArray(transporterCandidates)
+        ? transporterCandidates.filter((candidate) => candidate?.transporter)
+        : [];
+
+    if (!candidates.length) {
+        throw new Error('No configured email transporters available');
+    }
+
+    for (let index = 0; index < candidates.length; index += 1) {
+        const candidate = candidates[index];
+        for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
+            try {
+                logger.log(`📧 Attempt ${attempt}/${maxRetries} via ${candidate.name} to send email to: ${mailOptions.to}`);
+                const result = await candidate.transporter.sendMail(mailOptions);
+                return result;
+            } catch (error) {
+                lastError = error;
+                const isNetworkError = isTransientEmailError(error);
+                const hasRetriesLeft = attempt < maxRetries;
+
+                if (isNetworkError && hasRetriesLeft) {
+                    const delayMs = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+                    logger.warn(`⚠️ Network error on ${candidate.name} attempt ${attempt}, retrying in ${delayMs}ms...`, {
+                        code: error.code,
+                        message: error.message,
+                    });
+                    await new Promise(resolve => setTimeout(resolve, delayMs));
+                    continue;
+                }
+
+                if (!isNetworkError) {
+                    throw error;
+                }
+
+                const hasMoreTransports = index < candidates.length - 1;
+                if (hasMoreTransports) {
+                    logger.warn(`⚠️ Switching email transport from ${candidate.name} to ${candidates[index + 1].name} after transient failure`, {
+                        code: error.code,
+                        message: error.message,
+                    });
+                    break;
+                }
+
                 throw error;
             }
         }
@@ -218,6 +317,7 @@ const sendEmailWithRetry = async (transporter, mailOptions, maxRetries = 3) => {
 };
 export const sendEmailOTP = async (email, otp) => {
     let transporter;
+    let transporterCandidates = [];
 
     try {
         // Validate email configuration
@@ -227,7 +327,12 @@ export const sendEmailOTP = async (email, otp) => {
         }
 
         // Get configured transporter
-        transporter = getEmailTransporter();
+        transporterCandidates = getEmailTransporterCandidates();
+        transporter = transporterCandidates[0]?.transporter;
+
+        if (!transporter) {
+            throw new apiError(500, 'Email service not configured. Please contact support.');
+        }
 
         // Verify connection
         if (process.env.NODE_ENV !== 'production') {
@@ -263,7 +368,7 @@ export const sendEmailOTP = async (email, otp) => {
 
         // Send email
         try {
-            const result = await sendEmailWithRetry(transporter, mailOptions);
+            const result = await sendEmailWithRetry(transporterCandidates, mailOptions);
             logger.log(`✅ Email sent successfully to ${email} | Message ID: ${result.messageId}`);
 
             // Log for analytics (if using production service)
@@ -320,6 +425,7 @@ export const sendEmailOTP = async (email, otp) => {
 // ============================================
 export const sendEmailVerification = async (email, otp) => {
     let transporter;
+    let transporterCandidates = [];
 
     try {
         // Validate email configuration
@@ -329,7 +435,12 @@ export const sendEmailVerification = async (email, otp) => {
         }
 
         // Get configured transporter
-        transporter = getEmailTransporter();
+        transporterCandidates = getEmailTransporterCandidates();
+        transporter = transporterCandidates[0]?.transporter;
+
+        if (!transporter) {
+            throw new apiError(500, 'Email service not configured. Please contact support.');
+        }
 
         // Verify connection
         if (process.env.NODE_ENV !== 'production') {
@@ -394,7 +505,7 @@ export const sendEmailVerification = async (email, otp) => {
             logger.log(`📧 Attempting to send verification email to: ${email}`);
             logger.log(`📧 From: ${senderName} <${senderEmail}>`);
             
-            const result = await sendEmailWithRetry(transporter, mailOptions);
+            const result = await sendEmailWithRetry(transporterCandidates, mailOptions);
             logger.log(`✅ Email sent successfully to ${email} | Message ID: ${result.messageId}`);
 
             // Log for analytics (if using production service)

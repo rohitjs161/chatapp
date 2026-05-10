@@ -29,7 +29,7 @@ const VerifyEmail = () => {
   const navigate = useNavigate();
   const location = useLocation();
   const email = location.state?.email;
-  const emailSent = location.state?.emailSent !== false; // Default to true if not specified
+  const initialEmailSent = location.state?.emailSent !== false; // Default to true if not specified
   const flowType = location.pathname === '/verify-email-change' ? 'email-change' : 'signup';
   const { updateUser, user } = useAuthStore();
   const { isLocked: isSubmitting, runLockedAction } = useActionLock();
@@ -46,6 +46,7 @@ const VerifyEmail = () => {
   const [resendTimer, setResendTimer] = useState(initialResendRemaining);
   const [resendNotice, setResendNotice] = useState('');
   const [otpLocked, setOtpLocked] = useState(false);
+  const [deliveryState, setDeliveryState] = useState(initialEmailSent ? 'sent' : 'unknown');
   const inputRefs = useRef([]);
   const resendToastTimerRef = useRef(null);
   const [resendAvailableAt, setResendAvailableAt] = useState(initialResendAvailableAt);
@@ -94,6 +95,20 @@ const VerifyEmail = () => {
       }
     };
   }, [resendNotice]);
+
+  useEffect(() => {
+    if (flowType !== 'signup') {
+      return;
+    }
+
+    if (initialEmailSent) {
+      return;
+    }
+
+    if (deliveryState === 'unknown' && resendTimer === 0) {
+      setDeliveryState('failed');
+    }
+  }, [deliveryState, flowType, initialEmailSent, resendTimer]);
 
   const handleOtpChange = (index, value) => {
     if (otpLocked) return;
@@ -201,6 +216,10 @@ const VerifyEmail = () => {
       }
 
       if (response?.success === false) {
+        if (response?.data?.emailSent === false) {
+          setDeliveryState('failed');
+        }
+
         const blockedUntil = response?.data?.blockedUntil ? new Date(response.data.blockedUntil).getTime() : null;
         if (blockedUntil && blockedUntil > Date.now()) {
           setResendAvailableAt(blockedUntil);
@@ -212,6 +231,7 @@ const VerifyEmail = () => {
       }
 
       setOtpLocked(false);
+        setDeliveryState('sent');
       setResendAvailableAt(Date.now() + RESEND_COOLDOWN_SECONDS * 1000);
       setOtp(['', '', '', '', '', '']);
       setError('');
@@ -222,6 +242,9 @@ const VerifyEmail = () => {
         setResendAvailableAt(Date.now() + RESEND_COOLDOWN_SECONDS * 1000);
         setResendNotice('Please wait before requesting another OTP');
       } else {
+        if (flowType === 'signup') {
+          setDeliveryState('failed');
+        }
         setError(getAuthFriendlyErrorMessage(err, 'Failed to resend OTP. Please try again.'));
       }
     } finally {
@@ -245,9 +268,15 @@ const VerifyEmail = () => {
             </div>
           )}
 
-          {!emailSent && (
+          {deliveryState === 'failed' && (
             <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-800 shadow-sm">
               ⚠️ The verification email could not be delivered. Please click "Resend OTP" below to send it again.
+            </div>
+          )}
+
+          {deliveryState === 'unknown' && flowType === 'signup' && (
+            <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-800 shadow-sm">
+              Your account is ready for verification. If the OTP does not arrive shortly, use Resend OTP.
             </div>
           )}
 
@@ -259,7 +288,7 @@ const VerifyEmail = () => {
             </div>
             <h1 className="text-3xl font-bold text-slate-900">Verify Your Email</h1>
             <p className="mt-2 text-sm text-slate-600">
-              {emailSent ? (
+              {deliveryState === 'sent' ? (
                 <>We've sent a 6-digit OTP to<br /></>
               ) : (
                 <>Once you receive the OTP, enter it below.<br /></>

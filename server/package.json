@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "nodemon -r dotenv/config src/index.js",
     "start": "node src/index.js",
+    "test:email": "node src/scripts/testEmailConfig.js",
     "migrate:heal-conversation-requests": "node src/scripts/healLegacyConversationRequests.js",
     "migrate:heal-conversation-requests:dry": "node src/scripts/healLegacyConversationRequests.js --dry-run"
   },
