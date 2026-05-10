@@ -46,6 +46,40 @@ const EMAIL_CHANGE_OTP_RESEND_BLOCK_HOURS = 24;
 const MAX_DELETE_ACCOUNT_OTP_ATTEMPTS = 5;
 const MAX_DELETE_ACCOUNT_OTP_RESEND_ATTEMPTS = 3;
 const DELETE_ACCOUNT_OTP_RESEND_BLOCK_HOURS = 24;
+const EMAIL_DELIVERY_RESPONSE_TIMEOUT_MS = Math.max(
+    1000,
+    Number.parseInt(process.env.EMAIL_DELIVERY_RESPONSE_TIMEOUT_MS || '5000', 10) || 5000
+);
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const sendVerificationEmailWithBudget = async ({ email, otp, context = 'signup' }) => {
+    const timeoutToken = Symbol('email_send_timeout');
+    const sendPromise = sendEmailVerification(email, otp);
+
+    const outcome = await Promise.race([
+        sendPromise.then(() => ({ status: 'sent' })).catch((error) => ({ status: 'failed', error })),
+        wait(EMAIL_DELIVERY_RESPONSE_TIMEOUT_MS).then(() => timeoutToken),
+    ]);
+
+    if (outcome === timeoutToken) {
+        sendPromise
+            .then(() => {
+                logger.log(`✅ Verification email sent asynchronously for ${context}: ${email}`);
+            })
+            .catch((error) => {
+                logger.error(`❌ Async verification email failed for ${context}:`, {
+                    email,
+                    message: error?.message,
+                    code: error?.code,
+                });
+            });
+
+        return { status: 'queued' };
+    }
+
+    return outcome;
+};
 
 /**
  * Enhanced duplicate field detection with comprehensive error parsing
@@ -403,10 +437,15 @@ const registerUser = asyncHandler(async (req, res) => {
             pendingRegistration.otpResendAvailableAt = getNextResendAvailableAt();
             await pendingRegistration.save();
 
-            try {
-                await sendEmailVerification(emailNormalized, verificationOTP);
+            const emailDispatch = await sendVerificationEmailWithBudget({
+                email: emailNormalized,
+                otp: verificationOTP,
+                context: 'register-existing-pending',
+            });
+
+            if (emailDispatch.status === 'sent') {
                 logger.log('✅ Verification email sent successfully for existing pending registration');
-                
+
                 return res.status(200).json(
                     new apiResponse(
                         200,
@@ -419,7 +458,31 @@ const registerUser = asyncHandler(async (req, res) => {
                         'OTP resent. Please verify your email.'
                     )
                 );
-            } catch (error) {
+            }
+
+            if (emailDispatch.status === 'queued') {
+                logger.warn('⏳ Verification email dispatch queued for existing pending registration due to SMTP latency', {
+                    email: emailNormalized,
+                    responseTimeoutMs: EMAIL_DELIVERY_RESPONSE_TIMEOUT_MS,
+                });
+
+                return res.status(200).json(
+                    new apiResponse(
+                        200,
+                        {
+                            email: emailNormalized,
+                            username: usernameNormalized,
+                            verificationPending: true,
+                            otpResent: true,
+                            emailSent: false,
+                        },
+                        'Account saved. OTP delivery is in progress. If you do not receive it shortly, use "Resend OTP".'
+                    )
+                );
+            }
+
+            {
+                const error = emailDispatch.error;
                 logger.error('Signup verification email could not be sent for existing pending registration:', {
                     message: error?.message,
                     code: error?.code,
@@ -454,8 +517,13 @@ const registerUser = asyncHandler(async (req, res) => {
             otpResendAvailableAt: getNextResendAvailableAt(),
         });
 
-        try {
-            await sendEmailVerification(emailNormalized, verificationOTP);
+        const emailDispatch = await sendVerificationEmailWithBudget({
+            email: emailNormalized,
+            otp: verificationOTP,
+            context: 'register-new-pending',
+        });
+
+        if (emailDispatch.status === 'sent') {
             logger.log('✅ Verification email sent successfully for new pending registration');
 
             return res.status(200).json(
@@ -470,7 +538,30 @@ const registerUser = asyncHandler(async (req, res) => {
                     'Account created successfully. Please verify your email with the OTP sent to your inbox.'
                 )
             );
-        } catch (error) {
+        }
+
+        if (emailDispatch.status === 'queued') {
+            logger.warn('⏳ Verification email dispatch queued for new pending registration due to SMTP latency', {
+                email: emailNormalized,
+                responseTimeoutMs: EMAIL_DELIVERY_RESPONSE_TIMEOUT_MS,
+            });
+
+            return res.status(200).json(
+                new apiResponse(
+                    200,
+                    {
+                        email: emailNormalized,
+                        username: usernameNormalized,
+                        verificationPending: true,
+                        emailSent: false,
+                    },
+                    'Account created successfully. OTP delivery is in progress. If you do not receive it shortly, use "Resend OTP".'
+                )
+            );
+        }
+
+        {
+            const error = emailDispatch.error;
             logger.error('Signup verification email could not be sent for new pending registration:', {
                 message: error?.message,
                 code: error?.code,
@@ -1571,10 +1662,15 @@ const resendOTP = asyncHandler(async (req, res) => {
 
         await pendingRegistration.save({ validateBeforeSave: false });
 
-        try {
-            await sendEmailVerification(pendingRegistration.email, otp);
+        const emailDispatch = await sendVerificationEmailWithBudget({
+            email: pendingRegistration.email,
+            otp,
+            context: 'resend-signup-otp',
+        });
+
+        if (emailDispatch.status === 'sent') {
             logger.log('✅ Resend OTP email sent successfully');
-            
+
             return res.status(200).json(
                 new apiResponse(
                     200,
@@ -1586,7 +1682,30 @@ const resendOTP = asyncHandler(async (req, res) => {
                     'A new OTP has been sent to your email. Please check your inbox.'
                 )
             );
-        } catch (error) {
+        }
+
+        if (emailDispatch.status === 'queued') {
+            logger.warn('⏳ Resend OTP dispatch queued due to SMTP latency', {
+                email: pendingRegistration.email,
+                responseTimeoutMs: EMAIL_DELIVERY_RESPONSE_TIMEOUT_MS,
+            });
+
+            return res.status(200).json(
+                new apiResponse(
+                    200,
+                    {
+                        email: pendingRegistration.email,
+                        otpResent: true,
+                        verificationPending: true,
+                        emailSent: false,
+                    },
+                    'Your OTP request is being processed. If you do not receive it shortly, try resending again.'
+                )
+            );
+        }
+
+        {
+            const error = emailDispatch.error;
             logger.error('❌ Resend OTP email could not be sent:', {
                 message: error?.message,
                 code: error?.code,
