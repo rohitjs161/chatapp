@@ -138,13 +138,16 @@ const getEmailTransporterCandidates = () => {
             transporters.push({
                 name: 'gmail_587',
                 transporter: nodemailer.createTransport({
-                    service: 'gmail',
+                    host: 'smtp.gmail.com',
                     port: gmailPort,
+                    secure: false,
                     family: 4,
                     connectionTimeout: 60000,
                     greetingTimeout: 60000,
                     socketTimeout: 60000,
                     tls: {
+                        // Render/IPv4 production path is more stable with standard TLS verification relaxed
+                        // for Gmail SMTP than with strict service presets that can flip to port 465.
                         rejectUnauthorized: false,
                     },
                     auth: gmailAuth,
