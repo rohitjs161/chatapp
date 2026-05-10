@@ -74,6 +74,7 @@ const parsePositiveInt = (value, fallbackValue) => {
 
 const isTransientEmailError = (error = {}) => {
     const code = String(error?.code || '').toUpperCase();
+    const message = String(error?.message || '').toLowerCase();
     return [
         'ENETUNREACH',
         'ESOCKET',
@@ -83,7 +84,7 @@ const isTransientEmailError = (error = {}) => {
         'EHOSTUNREACH',
         'EAI_AGAIN',
         'ECONNRESET',
-    ].includes(code);
+    ].includes(code) || message.includes('connection pool was closed') || message.includes('pool was closed');
 };
 
 const toEmailErrorMeta = (error = {}) => ({
@@ -310,14 +311,12 @@ const createGmailTransporter = () => {
     try {
         if (transporter && typeof transporter.on === 'function') {
             transporter.on('error', (err) => {
-                logger.error('⚠️ Transporter error event, will reset singleton', toEmailErrorMeta(err));
-                try { if (globalEmailTransporter && typeof globalEmailTransporter.close === 'function') globalEmailTransporter.close(); } catch (e) {}
+                logger.error('⚠️ Transporter error event, clearing singleton cache', toEmailErrorMeta(err));
                 globalEmailTransporter = null;
             });
 
             transporter.on('close', () => {
-                logger.warn('⚠️ Transporter closed; clearing singleton for reconnect');
-                try { if (globalEmailTransporter && typeof globalEmailTransporter.close === 'function') globalEmailTransporter.close(); } catch (e) {}
+                logger.warn('⚠️ Transporter closed; clearing singleton cache for reconnect');
                 globalEmailTransporter = null;
             });
         }
@@ -355,7 +354,7 @@ export const getTransporter = () => {
 const safeResetTransporter = async () => {
     try {
         if (globalEmailTransporter && typeof globalEmailTransporter.close === 'function') {
-            try { await globalEmailTransporter.close(); } catch (_) {}
+            try { globalEmailTransporter.close(); } catch (_) {}
         }
     } catch (e) {
         // suppress
@@ -436,9 +435,9 @@ export const compareOTP = (inputOTP, storedHashedOTP) => {
 // Returns immediately after first success.
 const sendEmailWithRetry = async (mailOptions, maxRetries = 3) => {
     let lastError;
-    const transporter = getTransporter();
 
     for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
+        const transporter = getTransporter();
         try {
             logger.log(`📧 Attempt ${attempt}/${maxRetries} to send email to: ${mailOptions.to}`);
             const result = await transporter.sendMail(mailOptions);
