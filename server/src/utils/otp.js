@@ -1,6 +1,24 @@
 import crypto from 'crypto';
 import nodemailer from 'nodemailer';
 import dns from 'dns';
+
+// Prefer IPv4 when resolving hostnames to avoid Render IPv6 routing issues
+// Some Node versions allow configuring the default DNS result order so lookups
+// return IPv4 addresses first. This reduces chances of ENETUNREACH/ESOCKET
+// failures when the platform's IPv6 connectivity is unreliable.
+try {
+    if (typeof dns.setDefaultResultOrder === 'function') {
+        dns.setDefaultResultOrder('ipv4first');
+        // log only in non-production debugging scenarios
+        if (process.env.NODE_ENV !== 'production') {
+            console.log('📧 DNS default result order set to ipv4first');
+        }
+    }
+} catch (e) {
+    // Non-fatal: if the runtime doesn't support this API, continue and rely on
+    // the explicit lookup/family settings already applied to the transporter.
+    if (process.env.NODE_ENV !== 'production') console.warn('📧 dns.setDefaultResultOrder not available:', e?.message || e);
+}
 import { apiError } from './apiError.js';
 import { logger } from "./logger.js";
 
