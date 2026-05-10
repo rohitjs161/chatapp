@@ -125,7 +125,7 @@ const createGmailTransporter = () => {
     logger.log(`📧 Creating Gmail transporter - User: ${emailUser}`);
     logger.log('📧 Production Config: host=smtp.gmail.com, port=587, IPv4-only, pooled');
 
-    return nodemailer.createTransport({
+    const transporter = nodemailer.createTransport({
         host: 'smtp.gmail.com',
         port: 587,
         secure: false,
@@ -167,8 +167,8 @@ const createGmailTransporter = () => {
 
         // Connection pool to prevent socket exhaustion
         pool: true,
-        maxConnections: 5,         // Limit concurrent SMTP connections
-        maxMessages: 100,          // Max emails per connection
+        maxConnections: 1,         // Use a single pooled connection for Gmail on Render
+        maxMessages: Infinity,     // Keep reusing the same connection
         rateLimit: 5,              // Emails per second
         keepAlive: true,
 
@@ -184,6 +184,27 @@ const createGmailTransporter = () => {
         transactionLog: false, // Reduce memory usage
         dnsTimeout: 30000,
     });
+
+    // Attach lightweight listeners to detect transport-level failures and
+    // allow automatic recreation (reconnect) on next send.
+    try {
+        if (transporter && typeof transporter.on === 'function') {
+            transporter.on('error', (err) => {
+                logger.error('⚠️ Transporter error event, scheduling reconnect:', toEmailErrorMeta(err));
+                // Drop the cached transporter so next getTransporter() creates a new one
+                try { globalEmailTransporter = null; } catch (e) {}
+            });
+
+            transporter.on('close', () => {
+                logger.warn('⚠️ Transporter closed, clearing cached transporter to trigger reconnect');
+                try { globalEmailTransporter = null; } catch (e) {}
+            });
+        }
+    } catch (e) {
+        logger.warn('Could not attach transporter listeners:', e?.message || e);
+    }
+
+    return transporter;
 };
 
 // ============================================
