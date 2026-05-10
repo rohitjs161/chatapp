@@ -19,6 +19,9 @@ const FIELD_LIMITS = {
 
 const PASSWORD_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z\d]).+$/;
 
+const getSignupNetworkErrorMessage = () =>
+  'Network error. Please verify the backend CORS settings and try again.';
+
 const SignUp = () => {
   const navigate = useNavigate();
   const { register, isLoading, error, clearError } = useAuthStore();
@@ -134,6 +137,11 @@ const SignUp = () => {
             return;
           }
         } catch (err) {
+          if (!err?.response) {
+            setErrors(prev => ({ ...prev, email: getSignupNetworkErrorMessage() }));
+            return;
+          }
+
           // If backend validation fails (e.g., disposable email), show that message
           const serverMessage = err?.response?.data?.message || err?.message;
           if (serverMessage) {
@@ -149,9 +157,14 @@ const SignUp = () => {
             return;
           }
         } catch (err) {
+          if (!err?.response) {
+            setErrors(prev => ({ ...prev, email: getSignupNetworkErrorMessage() }));
+            return;
+          }
+
           const serverMessage = err?.response?.data?.message || err?.message;
           if (serverMessage) {
-            setErrors(prev => ({ ...prev, username: serverMessage }));
+            setErrors(prev => ({ ...prev, email: serverMessage }));
             return;
           }
         }
@@ -160,6 +173,11 @@ const SignUp = () => {
           const response = await register(payload);
           navigate('/verify-otp', { state: { email: payload.email, emailSent: response?.data?.emailSent } });
         } catch (err) {
+          if (!err?.response) {
+            setErrors(prev => ({ ...prev, email: getSignupNetworkErrorMessage() }));
+            return;
+          }
+
           const status = Number(err?.response?.status);
           const serverMessage = err?.response?.data?.message || err?.message || '';
 
@@ -174,9 +192,11 @@ const SignUp = () => {
               return;
             }
 
+            setErrors(prev => ({ ...prev, email: serverMessage || getSignupNetworkErrorMessage() }));
             throw err;
           }
 
+          setErrors(prev => ({ ...prev, email: serverMessage || getSignupNetworkErrorMessage() }));
           throw err;
         }
       });
