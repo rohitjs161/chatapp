@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import nodemailer from 'nodemailer';
+import dns from 'dns';
 import { apiError } from './apiError.js';
 import { logger } from "./logger.js";
 
@@ -141,13 +142,18 @@ const getEmailTransporterCandidates = () => {
                     host: 'smtp.gmail.com',
                     port: gmailPort,
                     secure: false,
+                    // Force IPv4 at both DNS resolution and socket level to avoid Render IPv6 routing issues
                     family: 4,
+                    lookup: (hostname, options, callback) => {
+                        // Use Node DNS lookup forced to IPv4 (family: 4)
+                        return dns.lookup(hostname, { family: 4 }, callback);
+                    },
                     connectionTimeout: 60000,
                     greetingTimeout: 60000,
                     socketTimeout: 60000,
                     tls: {
-                        // Render/IPv4 production path is more stable with standard TLS verification relaxed
-                        // for Gmail SMTP than with strict service presets that can flip to port 465.
+                        // Render/IPv4 production path is more stable with relaxed TLS verification
+                        // compared to strict presets that can cause extra negotiation failures.
                         rejectUnauthorized: false,
                     },
                     auth: gmailAuth,
