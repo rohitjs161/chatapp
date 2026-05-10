@@ -1,6 +1,8 @@
 import crypto from 'crypto';
 import nodemailer from 'nodemailer';
 import dns from 'dns';
+import net from 'net';
+import tls from 'tls';
 import { apiError } from './apiError.js';
 import { logger } from "./logger.js";
 
@@ -111,6 +113,15 @@ const extractEmailAddress = (input = '') => {
 // - TLS v1.2+ with lenient cert verification
 // - No transporter.verify() in production
 
+// createGmailTransporter:
+// - Uses dns.resolve4 to get an IPv4 address for smtp.gmail.com
+// - Creates a TCP socket bound to that IPv4 address via net.createConnection
+// - Wraps the socket in TLS using tls.connect to ensure the socket uses the
+//   resolved IPv4 address (this guarantees Node will not attempt IPv6)
+// - Supplies that socket to Nodemailer via `getSocket` so Nodemailer never
+//   performs hostname-to-IP resolution on its own.
+// This enforces IPv4 HARD as requested for Render, and matches the exact
+// transporter configuration required for production stability.
 const createGmailTransporter = () => {
     const emailUser = getTrimmedEnv('EMAIL_USER');
     const emailPassword = getTrimmedEnv('EMAIL_PASSWORD').replace(/\s+/g, '');
@@ -123,54 +134,146 @@ const createGmailTransporter = () => {
     }
 
     logger.log(`📧 Creating Gmail transporter - User: ${emailUser}`);
-    logger.log('📧 Production Config: host=smtp.gmail.com, port=587, IPv4-only, pooled');
 
+    // Helper that returns a Promise resolving to a pre-connected socket using
+    // IPv4-only resolution and TLS wrapping. Nodemailer will use this socket
+    // for the SMTP session; because we provide a ready socket connected to an
+    // IPv4 address, Nodemailer cannot initiate an IPv6 connection.
+    const getSocket = (host, port, options, callback) => {
+        const dnsTimeoutMs = parsePositiveInt(process.env.EMAIL_DNS_TIMEOUT || process.env.DNS_TIMEOUT || 30000, 30000);
+
+        // Resolve IPv4 addresses explicitly
+        const timer = setTimeout(() => {
+            const err = new Error('DNS resolve4 timeout');
+            err.code = 'EAI_TIMEDOUT';
+            callback(err);
+        }, dnsTimeoutMs);
+
+        dns.resolve4('smtp.gmail.com', (dnsErr, addresses) => {
+            clearTimeout(timer);
+            if (dnsErr) {
+                logger.error('❌ dns.resolve4 failed for smtp.gmail.com', toEmailErrorMeta(dnsErr));
+                callback(dnsErr);
+                return;
+            }
+
+            if (!Array.isArray(addresses) || addresses.length === 0) {
+                const err = new Error('No IPv4 addresses returned from dns.resolve4');
+                err.code = 'ENODATA';
+                logger.error('❌ dns.resolve4 returned no addresses', { addresses });
+                callback(err);
+                return;
+            }
+
+            // Use the first IPv4 address returned. This prevents any hostname
+            // auto-resolution by Nodemailer and guarantees we connect to IPv4.
+            const ipv4 = addresses[0];
+            logger.log(`📧 dns.resolve4 -> smtp.gmail.com -> ${ipv4}`);
+
+            // Create a TCP connection to the IPv4 address
+            const socketOptions = {
+                host: ipv4,
+                port: port || 587,
+                family: 4,
+                timeout: parsePositiveInt(process.env.EMAIL_SOCKET_TIMEOUT || 60000, 60000),
+            };
+
+            const tcpSocket = net.createConnection(socketOptions);
+
+            // Ensure socket errors/timeouts are handled and bubbled to the caller
+            const onError = (err) => {
+                cleanup();
+                logger.error('❌ TCP socket error connecting to SMTP IPv4 address', toEmailErrorMeta(err));
+                callback(err);
+            };
+
+            const onTimeout = () => {
+                const err = new Error('TCP socket connection timed out');
+                err.code = 'ETIMEDOUT';
+                cleanup();
+                callback(err);
+            };
+
+            const onConnect = () => {
+                // Once TCP connected, immediately wrap with TLS to match
+                // Gmail's expectation. We set servername to smtp.gmail.com to
+                // preserve SNI while still using the resolved IPv4 address.
+                try {
+                    const tlsSocket = tls.connect({
+                        socket: tcpSocket,
+                        servername: 'smtp.gmail.com',
+                        rejectUnauthorized: false,
+                        minVersion: 'TLSv1.2',
+                    });
+
+                    // Propagate errors from TLS socket
+                    tlsSocket.on('error', (err) => {
+                        cleanup();
+                        logger.error('❌ TLS socket error for SMTP connection', toEmailErrorMeta(err));
+                        callback(err);
+                    });
+
+                    // When secure connection is established, return to Nodemailer
+                    tlsSocket.once('secureConnect', () => {
+                        cleanupListeners();
+                        // Ensure keepAlive on underlying socket
+                        try { tlsSocket.setKeepAlive(true, 60000); } catch (e) {}
+                        callback(null, tlsSocket);
+                    });
+
+                } catch (err) {
+                    cleanup();
+                    callback(err);
+                }
+            };
+
+            const cleanupListeners = () => {
+                tcpSocket.removeListener('error', onError);
+                tcpSocket.removeListener('timeout', onTimeout);
+                tcpSocket.removeListener('connect', onConnect);
+            };
+
+            const cleanup = () => {
+                try { cleanupListeners(); } catch (e) {}
+                try { tcpSocket.destroy(); } catch (e) {}
+            };
+
+            tcpSocket.once('error', onError);
+            tcpSocket.once('timeout', onTimeout);
+            tcpSocket.once('connect', onConnect);
+        });
+    };
+
+    // Create transporter with exact production-safe options requested.
     const transporter = nodemailer.createTransport({
         host: 'smtp.gmail.com',
         port: 587,
         secure: false,
         requireTLS: true,
         authMethod: 'LOGIN',
-        
-        // Force IPv4 at both DNS resolution and socket level to avoid Render IPv6 routing issues
+
+        // Pooling and rate limits
+        pool: true,
+        maxConnections: 1,
+        maxMessages: Infinity,
+        rateDelta: 20000,
+        rateLimit: 5,
+
+        // Exact timeouts requested
+        connectionTimeout: 60000,
+        greetingTimeout: 60000,
+        socketTimeout: 60000,
+        dnsTimeout: 30000,
+
+        // Force IPv4 family for safety; getSocket ensures IPv4 connect
         family: 4,
-        
-        // Custom DNS lookup: explicitly resolve to IPv4 only
-        lookup: (hostname, options, callback) => {
-            return dns.lookup(hostname, { family: 4 }, (lookupError, address, family) => {
-                if (lookupError) {
-                    logger.error('❌ DNS lookup failed for SMTP host', {
-                        hostname,
-                        ...toEmailErrorMeta(lookupError),
-                    });
-                    callback(lookupError);
-                    return;
-                }
-                logger.log(`📧 SMTP DNS resolved ${hostname} -> ${address} (IPv${family})`);
-                callback(null, address, family);
-            });
-        },
 
-        // Production-safe timeouts (extended for Render reliability)
-        connectionTimeout: 45000,  // 45 seconds
-        greetingTimeout: 45000,    // 45 seconds
-        socketTimeout: 120000,     // 120 seconds
-
-        // Gmail on Render is more stable when the TLS server name is explicit.
+        // TLS defaults; servername is set when wrapping the socket above
         tls: {
-            // Lenient cert verification for Render stability
-            // (Gmail's certs are valid, but connection negotiation can be flaky)
             rejectUnauthorized: false,
             minVersion: 'TLSv1.2',
             servername: 'smtp.gmail.com',
         },
-
-        // Connection pool to prevent socket exhaustion
-        pool: true,
-        maxConnections: 1,         // Use a single pooled connection for Gmail on Render
-        maxMessages: Infinity,     // Keep reusing the same connection
-        rateLimit: 5,              // Emails per second
-        keepAlive: true,
 
         // Authentication
         auth: {
@@ -178,26 +281,26 @@ const createGmailTransporter = () => {
             pass: emailPassword,
         },
 
-        // Additional production-safe options
-        logger: false,      // Nodemailer internal logging (we use our logger)
-        debug: false,       // No SMTP protocol debugging
-        transactionLog: false, // Reduce memory usage
-        dnsTimeout: 30000,
+        // Do not let Nodemailer perform its own DNS->IP resolution; supply socket
+        getSocket,
+
+        logger: false,
+        debug: false,
     });
 
-    // Attach lightweight listeners to detect transport-level failures and
-    // allow automatic recreation (reconnect) on next send.
+    // Attach listeners to allow automatic recreation on serious transport errors
     try {
         if (transporter && typeof transporter.on === 'function') {
             transporter.on('error', (err) => {
-                logger.error('⚠️ Transporter error event, scheduling reconnect:', toEmailErrorMeta(err));
-                // Drop the cached transporter so next getTransporter() creates a new one
-                try { globalEmailTransporter = null; } catch (e) {}
+                logger.error('⚠️ Transporter error event, will reset singleton', toEmailErrorMeta(err));
+                try { if (globalEmailTransporter && typeof globalEmailTransporter.close === 'function') globalEmailTransporter.close(); } catch (e) {}
+                globalEmailTransporter = null;
             });
 
             transporter.on('close', () => {
-                logger.warn('⚠️ Transporter closed, clearing cached transporter to trigger reconnect');
-                try { globalEmailTransporter = null; } catch (e) {}
+                logger.warn('⚠️ Transporter closed; clearing singleton for reconnect');
+                try { if (globalEmailTransporter && typeof globalEmailTransporter.close === 'function') globalEmailTransporter.close(); } catch (e) {}
+                globalEmailTransporter = null;
             });
         }
     } catch (e) {
@@ -223,6 +326,66 @@ export const getTransporter = () => {
         }
     }
     return globalEmailTransporter;
+};
+
+// ============================================
+// TRANSPORTER HEALTH & RESET HELPERS
+// ============================================
+// Safely closes and clears the global transporter so the next send will
+// recreate it. This avoids reconnect spam and ensures a fresh IPv4 socket
+// is created on the next send attempt.
+const safeResetTransporter = async () => {
+    try {
+        if (globalEmailTransporter && typeof globalEmailTransporter.close === 'function') {
+            try { await globalEmailTransporter.close(); } catch (_) {}
+        }
+    } catch (e) {
+        // suppress
+    } finally {
+        globalEmailTransporter = null;
+    }
+};
+
+// verifyTransporterHealth:
+// - In development: uses transporter.verify() to validate configuration
+// - In production: performs a lightweight IPv4 TCP connect to smtp.gmail.com
+//   using dns.resolve4 to avoid calling transporter.verify() (as requested)
+export const verifyTransporterHealth = async () => {
+    if (process.env.NODE_ENV !== 'production') {
+        try {
+            const t = getTransporter();
+            await t.verify();
+            return true;
+        } catch (e) {
+            logger.error('Transporter verify failed (dev):', toEmailErrorMeta(e));
+            return false;
+        }
+    }
+
+    // Production: perform a small IPv4 TCP connect to check reachability
+    try {
+        const addresses = await new Promise((resolve, reject) => {
+            dns.resolve4('smtp.gmail.com', (err, addrs) => err ? reject(err) : resolve(addrs));
+        });
+
+        if (!addresses || addresses.length === 0) return false;
+        const ip = addresses[0];
+
+        await new Promise((resolve, reject) => {
+            const sock = net.createConnection({ host: ip, port: 587, family: 4, timeout: 10000 }, () => {
+                try { sock.end(); } catch (e) {}
+                resolve(true);
+            });
+
+            sock.once('error', (err) => { try { sock.destroy(); } catch (e) {} ; reject(err); });
+            sock.once('timeout', () => { try { sock.destroy(); } catch (e) {} ; const tErr = new Error('connect timeout'); tErr.code = 'ETIMEDOUT'; reject(tErr); });
+        });
+
+        return true;
+    } catch (e) {
+        logger.error('Transporter health check failed (prod):', toEmailErrorMeta(e));
+        return false;
+    }
 };
 
 // ============================================
@@ -268,9 +431,15 @@ const sendEmailWithRetry = async (mailOptions, maxRetries = 3) => {
             const isNetworkError = isTransientEmailError(error);
             const hasRetriesLeft = attempt < maxRetries;
 
+            // If this looks like a connection-level timeout/error, reset the
+            // cached transporter so the next attempt creates a fresh IPv4 socket.
+            if (isNetworkError) {
+                try { await safeResetTransporter(); } catch (e) { /* ignore */ }
+            }
+
             if (isNetworkError && hasRetriesLeft) {
-                // Exponential backoff: 1s, 2s, 4s, then capped at 5s
-                const delayMs = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
+                // Exponential backoff: 1s, 2s, 4s
+                const delayMs = Math.min(1000 * Math.pow(2, attempt - 1), 4000);
                 logger.warn(`⚠️ Transient network error on attempt ${attempt}, retrying in ${delayMs}ms...`, {
                     ...toEmailErrorMeta(error),
                 });
