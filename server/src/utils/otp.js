@@ -140,6 +140,24 @@ const createGmailTransporter = () => {
     // for the SMTP session; because we provide a ready socket connected to an
     // IPv4 address, Nodemailer cannot initiate an IPv6 connection.
     const getSocket = (host, port, options, callback) => {
+        // Normalize arguments: Nodemailer may call getSocket with different
+        // signatures. Ensure `port` is a number and `callback` is a function.
+        if (typeof port === 'function') {
+            callback = port;
+            port = undefined;
+            options = options || {};
+        } else if (typeof options === 'function') {
+            callback = options;
+            options = {};
+        }
+
+        // Ensure port is a number or fallback to 587
+        const portNum = Number(port || (options && options.port) || 587);
+        
+        // defensive: if callback is not a function, throw
+        if (typeof callback !== 'function') {
+            throw new TypeError('getSocket callback must be a function');
+        }
         const dnsTimeoutMs = parsePositiveInt(process.env.EMAIL_DNS_TIMEOUT || process.env.DNS_TIMEOUT || 30000, 30000);
 
         // Resolve IPv4 addresses explicitly
@@ -173,7 +191,7 @@ const createGmailTransporter = () => {
             // Create a TCP connection to the IPv4 address
             const socketOptions = {
                 host: ipv4,
-                port: port || 587,
+                port: portNum,
                 family: 4,
                 timeout: parsePositiveInt(process.env.EMAIL_SOCKET_TIMEOUT || 60000, 60000),
             };
