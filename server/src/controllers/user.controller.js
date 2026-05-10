@@ -309,35 +309,6 @@ const getPendingRegistrationsForSignup = async ({ email, username }) => {
     return records.filter((record) => !isPendingRegistrationExpired(record));
 };
 
-const deletePendingRegistrationSafely = async (pendingRegistrationId) => {
-    if (!pendingRegistrationId) {
-        return;
-    }
-
-    try {
-        await PendingRegistration.findByIdAndDelete(pendingRegistrationId);
-        logger.log('🧹 Cleanup executed: pending registration removed', { pendingRegistrationId });
-    } catch (error) {
-        logger.warn('⚠️ Cleanup failed for pending registration', {
-            pendingRegistrationId,
-            message: error?.message,
-        });
-    }
-};
-
-const cleanupPendingRegistrationOnEmailFailure = async (pendingRegistration, context, error) => {
-    if (pendingRegistration?._id) {
-        await deletePendingRegistrationSafely(pendingRegistration._id);
-    }
-
-    logger.error(`❌ SMTP failed during ${context}; pending registration cleaned up`, {
-        email: pendingRegistration?.email,
-        username: pendingRegistration?.username,
-        code: error?.code,
-        message: error?.message,
-    });
-};
-
 const getSignupCooldownSecondsRemaining = (pendingRegistration) => {
     const resendAvailableAt = pendingRegistration?.otpResendAvailableAt
         ? new Date(pendingRegistration.otpResendAvailableAt).getTime()
@@ -459,39 +430,80 @@ const registerUser = asyncHandler(async (req, res) => {
             pendingRegistration.email = emailNormalized;
             pendingRegistration.password = hashedPassword;
 
-            await sendEmailVerification(emailNormalized, verificationOTP);
-
             pendingRegistration.emailVerificationOTP = hashedOTP;
             pendingRegistration.emailVerificationOTPExpiry = otpExpiry;
             pendingRegistration.emailVerificationAttempts = 0;
             pendingRegistration.otpResendAttempts = 0;
             pendingRegistration.otpResendBlockedUntil = null;
             pendingRegistration.otpResendAvailableAt = getNextResendAvailableAt();
+            await pendingRegistration.save();
 
-            try {
-                await pendingRegistration.save();
-            } catch (saveError) {
-                await cleanupPendingRegistrationOnEmailFailure(pendingRegistration, 'register-existing-pending-save', saveError);
-                throw saveError;
+            const emailDispatch = await sendVerificationEmailWithBudget({
+                email: emailNormalized,
+                otp: verificationOTP,
+                context: 'register-existing-pending',
+            });
+
+            if (emailDispatch.status === 'sent') {
+                logger.log('✅ Verification email sent successfully for existing pending registration');
+
+                return res.status(200).json(
+                    new apiResponse(
+                        200,
+                        {
+                            email: emailNormalized,
+                            username: usernameNormalized,
+                            otpResent: true,
+                            emailSent: true,
+                        },
+                        'OTP resent. Please verify your email.'
+                    )
+                );
             }
 
-            logger.log('✅ Verification email sent successfully for existing pending registration');
+            if (emailDispatch.status === 'queued') {
+                logger.warn('⏳ Verification email dispatch queued for existing pending registration due to SMTP latency', {
+                    email: emailNormalized,
+                    responseTimeoutMs: EMAIL_DELIVERY_RESPONSE_TIMEOUT_MS,
+                });
 
-            return res.status(200).json(
-                new apiResponse(
-                    200,
-                    {
-                        email: emailNormalized,
-                        username: usernameNormalized,
-                        otpResent: true,
-                        emailSent: true,
-                    },
-                    'OTP resent. Please verify your email.'
-                )
-            );
+                return res.status(200).json(
+                    new apiResponse(
+                        200,
+                        {
+                            email: emailNormalized,
+                            username: usernameNormalized,
+                            verificationPending: true,
+                            otpResent: true,
+                            emailSent: false,
+                        },
+                        'Account saved. OTP delivery is in progress. If you do not receive it shortly, use "Resend OTP".'
+                    )
+                );
+            }
+
+            {
+                const error = emailDispatch.error;
+                logger.error('Signup verification email could not be sent for existing pending registration:', {
+                    message: error?.message,
+                    code: error?.code,
+                });
+
+                return res.status(200).json(
+                    new apiResponse(
+                        200,
+                        {
+                            email: emailNormalized,
+                            username: usernameNormalized,
+                            verificationPending: true,
+                            otpResent: false,
+                            emailSent: false,
+                        },
+                        'Account saved. Verification email could not be delivered. Please check your email or use "Resend OTP" to try again.'
+                    )
+                );
+            }
         }
-
-        await sendEmailVerification(emailNormalized, verificationOTP);
 
         pendingRegistration = await PendingRegistration.create({
             fullName,
@@ -506,20 +518,69 @@ const registerUser = asyncHandler(async (req, res) => {
             otpResendAvailableAt: getNextResendAvailableAt(),
         });
 
-        logger.log('✅ Verification email sent and pending registration saved for new signup');
+        const emailDispatch = await sendVerificationEmailWithBudget({
+            email: emailNormalized,
+            otp: verificationOTP,
+            context: 'register-new-pending',
+        });
 
-        return res.status(200).json(
-            new apiResponse(
-                200,
-                {
-                    email: emailNormalized,
-                    username: usernameNormalized,
-                    verificationPending: true,
-                    emailSent: true,
-                },
-                'Account created successfully. Please verify your email with the OTP sent to your inbox.'
-            )
-        );
+        if (emailDispatch.status === 'sent') {
+            logger.log('✅ Verification email sent successfully for new pending registration');
+
+            return res.status(200).json(
+                new apiResponse(
+                    200,
+                    {
+                        email: emailNormalized,
+                        username: usernameNormalized,
+                        verificationPending: true,
+                        emailSent: true,
+                    },
+                    'Account created successfully. Please verify your email with the OTP sent to your inbox.'
+                )
+            );
+        }
+
+        if (emailDispatch.status === 'queued') {
+            logger.warn('⏳ Verification email dispatch queued for new pending registration due to SMTP latency', {
+                email: emailNormalized,
+                responseTimeoutMs: EMAIL_DELIVERY_RESPONSE_TIMEOUT_MS,
+            });
+
+            return res.status(200).json(
+                new apiResponse(
+                    200,
+                    {
+                        email: emailNormalized,
+                        username: usernameNormalized,
+                        verificationPending: true,
+                        emailSent: false,
+                    },
+                    'Account created successfully. OTP delivery is in progress. If you do not receive it shortly, use "Resend OTP".'
+                )
+            );
+        }
+
+        {
+            const error = emailDispatch.error;
+            logger.error('Signup verification email could not be sent for new pending registration:', {
+                message: error?.message,
+                code: error?.code,
+            });
+
+            return res.status(200).json(
+                new apiResponse(
+                    200,
+                    {
+                        email: emailNormalized,
+                        username: usernameNormalized,
+                        verificationPending: true,
+                        emailSent: false,
+                    },
+                    'Account created successfully. Verification email could not be delivered. Please check your email or use "Resend OTP" to send it again.'
+                )
+            );
+        }
     } catch (error) {
         logger.error('Pending registration failed', {
             code: error?.code,
@@ -1543,7 +1604,6 @@ const resendOTP = asyncHandler(async (req, res) => {
 
     if (pendingRegistration) {
         if (!pendingRegistration.emailVerificationOTPExpiry) {
-            await deletePendingRegistrationSafely(pendingRegistration._id);
             return res.status(200).json(
                 new apiResponse(
                     200,
@@ -1555,7 +1615,6 @@ const resendOTP = asyncHandler(async (req, res) => {
         }
 
         if (isPendingRegistrationExpired(pendingRegistration)) {
-            await deletePendingRegistrationSafely(pendingRegistration._id);
             return res.status(200).json(
                 new apiResponse(
                     200,
@@ -1600,19 +1659,12 @@ const resendOTP = asyncHandler(async (req, res) => {
             });
         }
 
-        const resendOtp = generateOTP();
-        const hashedResendOtp = hashOTP(resendOtp);
-        const resendOtpExpiry = getOtpExpiryDate();
+        const otp = generateOTP();
+        const hashedOTP = hashOTP(otp);
+        const otpExpiry = getOtpExpiryDate();
 
-        try {
-            await sendEmailVerification(pendingRegistration.email, resendOtp);
-        } catch (error) {
-            await cleanupPendingRegistrationOnEmailFailure(pendingRegistration, 'resend-signup-otp', error);
-            throw new apiError(503, 'Unable to deliver verification email. Please try again.');
-        }
-
-        pendingRegistration.emailVerificationOTP = hashedResendOtp;
-        pendingRegistration.emailVerificationOTPExpiry = resendOtpExpiry;
+        pendingRegistration.emailVerificationOTP = hashedOTP;
+        pendingRegistration.emailVerificationOTPExpiry = otpExpiry;
         pendingRegistration.emailVerificationAttempts = 0;
         pendingRegistration.otpResendAttempts = (pendingRegistration.otpResendAttempts || 0) + 1;
         if (pendingRegistration.otpResendAttempts >= MAX_SIGNUP_OTP_RESEND_ATTEMPTS) {
@@ -1620,26 +1672,69 @@ const resendOTP = asyncHandler(async (req, res) => {
         }
         pendingRegistration.otpResendAvailableAt = getNextResendAvailableAt();
 
-        try {
-            await pendingRegistration.save({ validateBeforeSave: false });
-        } catch (saveError) {
-            await cleanupPendingRegistrationOnEmailFailure(pendingRegistration, 'resend-signup-otp-save', saveError);
-            throw saveError;
+        await pendingRegistration.save({ validateBeforeSave: false });
+
+        const emailDispatch = await sendVerificationEmailWithBudget({
+            email: pendingRegistration.email,
+            otp,
+            context: 'resend-signup-otp',
+        });
+
+        if (emailDispatch.status === 'sent') {
+            logger.log('✅ Resend OTP email sent successfully');
+
+            return res.status(200).json(
+                new apiResponse(
+                    200,
+                    {
+                        email: pendingRegistration.email,
+                        otpResent: true,
+                        emailSent: true,
+                    },
+                    'A new OTP has been sent to your email. Please check your inbox.'
+                )
+            );
         }
 
-        logger.log('✅ Resend OTP email sent and pending registration updated successfully');
+        if (emailDispatch.status === 'queued') {
+            logger.warn('⏳ Resend OTP dispatch queued due to SMTP latency', {
+                email: pendingRegistration.email,
+                responseTimeoutMs: EMAIL_DELIVERY_RESPONSE_TIMEOUT_MS,
+            });
 
-        return res.status(200).json(
-            new apiResponse(
-                200,
-                {
-                    email: pendingRegistration.email,
-                    otpResent: true,
-                    emailSent: true,
-                },
-                'A new OTP has been sent to your email. Please check your inbox.'
-            )
-        );
+            return res.status(200).json(
+                new apiResponse(
+                    200,
+                    {
+                        email: pendingRegistration.email,
+                        otpResent: true,
+                        verificationPending: true,
+                        emailSent: false,
+                    },
+                    'Your OTP request is being processed. If you do not receive it shortly, try resending again.'
+                )
+            );
+        }
+
+        {
+            const error = emailDispatch.error;
+            logger.error('❌ Resend OTP email could not be sent:', {
+                message: error?.message,
+                code: error?.code,
+            });
+
+            return res.status(200).json(
+                new apiResponse(
+                    200,
+                    {
+                        email: pendingRegistration.email,
+                        verificationPending: true,
+                        emailSent: false,
+                    },
+                    'The verification email could not be delivered. Please check your email or try again in a moment.'
+                )
+            );
+        }
     } else {
         // Password reset flow: keep existing behavior for reset-password OTP resend
         if (!user.resetPasswordOTPExpiry) {
@@ -1868,7 +1963,7 @@ const verifyEmailOTP = asyncHandler(async (req, res) => {
 
     // Check if OTP exists
     if (!pendingRegistration.emailVerificationOTP || !pendingRegistration.emailVerificationOTPExpiry) {
-        await deletePendingRegistrationSafely(pendingRegistration._id);
+        await PendingRegistration.findByIdAndDelete(pendingRegistration._id);
         return res.status(200).json({
             success: false,
             status: 'error',
@@ -1879,7 +1974,7 @@ const verifyEmailOTP = asyncHandler(async (req, res) => {
 
     // Check OTP expiry
     if (new Date() > pendingRegistration.emailVerificationOTPExpiry) {
-        await deletePendingRegistrationSafely(pendingRegistration._id);
+        await PendingRegistration.findByIdAndDelete(pendingRegistration._id);
 
         return res.status(200).json({
             success: false,
@@ -1929,7 +2024,7 @@ const verifyEmailOTP = asyncHandler(async (req, res) => {
     });
 
     if (existingUser) {
-        await deletePendingRegistrationSafely(pendingRegistration._id);
+        await PendingRegistration.findByIdAndDelete(pendingRegistration._id);
 
         if (existingUser.email === normalizedEmail) {
             return res.status(200).json({
