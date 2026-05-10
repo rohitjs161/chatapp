@@ -1,6 +1,8 @@
 import crypto from 'crypto';
 import nodemailer from 'nodemailer';
 import dns from 'dns';
+import { apiError } from './apiError.js';
+import { logger } from "./logger.js";
 
 // Prefer IPv4 when resolving hostnames to avoid Render IPv6 routing issues
 // Some Node versions allow configuring the default DNS result order so lookups
@@ -9,18 +11,13 @@ import dns from 'dns';
 try {
     if (typeof dns.setDefaultResultOrder === 'function') {
         dns.setDefaultResultOrder('ipv4first');
-        // log only in non-production debugging scenarios
-        if (process.env.NODE_ENV !== 'production') {
-            console.log('📧 DNS default result order set to ipv4first');
-        }
+        logger.log('📧 DNS default result order set to ipv4first');
     }
 } catch (e) {
     // Non-fatal: if the runtime doesn't support this API, continue and rely on
     // the explicit lookup/family settings already applied to the transporter.
-    if (process.env.NODE_ENV !== 'production') console.warn('📧 dns.setDefaultResultOrder not available:', e?.message || e);
+    logger.warn('📧 dns.setDefaultResultOrder not available:', e?.message || e);
 }
-import { apiError } from './apiError.js';
-import { logger } from "./logger.js";
 
 const getTrimmedEnv = (name) => {
     const value = process.env[name];
@@ -69,6 +66,15 @@ const isTransientEmailError = (error = {}) => {
         'EAI_AGAIN',
     ].includes(code);
 };
+
+const toEmailErrorMeta = (error = {}) => ({
+    code: error?.code,
+    message: error?.message,
+    responseCode: error?.responseCode,
+    command: error?.command,
+    errno: error?.errno,
+    syscall: error?.syscall,
+});
 
 // ============================================
 // CONFIGURE TRANSPORTER BASED ON ENVIRONMENT
@@ -143,7 +149,7 @@ const getEmailTransporterCandidates = () => {
             }
 
             logger.log(`📧 Using Gmail configuration - User: ${emailUser}`);
-            logger.log(`📧 Gmail SMTP: service=gmail, port=${gmailPort}, IPv4 only`);
+            logger.log(`📧 Gmail SMTP: host=smtp.gmail.com, port=${gmailPort}, IPv4 only`);
             logger.log(`📧 Note: Gmail requires an App Password (not your main password). Generate one at: https://myaccount.google.com/apppasswords`);
             logger.log('📧 Render production note: port 465 fallback removed to avoid IPv6 and TLS negotiation instability.');
             const gmailAuth = {
@@ -160,15 +166,28 @@ const getEmailTransporterCandidates = () => {
                     host: 'smtp.gmail.com',
                     port: gmailPort,
                     secure: false,
+                    requireTLS: true,
                     // Force IPv4 at both DNS resolution and socket level to avoid Render IPv6 routing issues
                     family: 4,
                     lookup: (hostname, options, callback) => {
                         // Use Node DNS lookup forced to IPv4 (family: 4)
-                        return dns.lookup(hostname, { family: 4 }, callback);
+                        return dns.lookup(hostname, { family: 4 }, (lookupError, address, family) => {
+                            if (lookupError) {
+                                logger.error('❌ DNS lookup failed for SMTP host', {
+                                    hostname,
+                                    ...toEmailErrorMeta(lookupError),
+                                });
+                                callback(lookupError);
+                                return;
+                            }
+
+                            logger.log(`📧 SMTP DNS resolved ${hostname} -> ${address} (IPv${family})`);
+                            callback(null, address, family);
+                        });
                     },
-                    connectionTimeout: 60000,
-                    greetingTimeout: 60000,
-                    socketTimeout: 60000,
+                    connectionTimeout: transportTimeouts.connectionTimeout,
+                    greetingTimeout: transportTimeouts.greetingTimeout,
+                    socketTimeout: transportTimeouts.socketTimeout,
                     tls: {
                         // Render/IPv4 production path is more stable with relaxed TLS verification
                         // compared to strict presets that can cause extra negotiation failures.
@@ -296,8 +315,7 @@ const sendEmailWithRetry = async (transporterCandidates, mailOptions, maxRetries
                 if (isNetworkError && hasRetriesLeft) {
                     const delayMs = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
                     logger.warn(`⚠️ Network error on ${candidate.name} attempt ${attempt}, retrying in ${delayMs}ms...`, {
-                        code: error.code,
-                        message: error.message,
+                        ...toEmailErrorMeta(error),
                     });
                     await new Promise(resolve => setTimeout(resolve, delayMs));
                     continue;
@@ -310,8 +328,7 @@ const sendEmailWithRetry = async (transporterCandidates, mailOptions, maxRetries
                 const hasMoreTransports = index < candidates.length - 1;
                 if (hasMoreTransports) {
                     logger.warn(`⚠️ Switching email transport from ${candidate.name} to ${candidates[index + 1].name} after transient failure`, {
-                        code: error.code,
-                        message: error.message,
+                        ...toEmailErrorMeta(error),
                     });
                     break;
                 }
@@ -349,11 +366,7 @@ export const sendEmailOTP = async (email, otp) => {
                 logger.log('✅ Email service connected');
             } catch (verifyError) {
                 logger.error('❌ Email authentication failed:', {
-                    message: verifyError.message,
-                    code: verifyError.code,
-                    response: verifyError.response,
-                    responseCode: verifyError.responseCode,
-                    command: verifyError.command,
+                    ...toEmailErrorMeta(verifyError),
                 });
                 throw new apiError(500, 'Email service authentication failed. Check configuration.');
             }
@@ -394,13 +407,8 @@ export const sendEmailOTP = async (email, otp) => {
 
         } catch (sendError) {
             const errorInfo = {
-                message: sendError.message,
-                code: sendError.code,
+                ...toEmailErrorMeta(sendError),
                 response: sendError.response,
-                responseCode: sendError.responseCode,
-                command: sendError.command,
-                errno: sendError.errno,
-                syscall: sendError.syscall,
             };
 
             logger.error('❌ Failed to send email:', {
@@ -464,13 +472,8 @@ export const sendEmailVerification = async (email, otp) => {
                 logger.log('✅ Email service connected and authenticated successfully');
             } catch (verifyError) {
                 const verifyErrorInfo = {
-                    message: verifyError.message,
-                    code: verifyError.code,
+                    ...toEmailErrorMeta(verifyError),
                     response: verifyError.response,
-                    responseCode: verifyError.responseCode,
-                    command: verifyError.command,
-                    errno: verifyError.errno,
-                    syscall: verifyError.syscall,
                 };
                 
                 logger.error('❌ Email service verification failed:', verifyErrorInfo);
