@@ -76,6 +76,74 @@ const toEmailErrorMeta = (error = {}) => ({
     syscall: error?.syscall,
 });
 
+const extractEmailAddress = (input = '') => {
+    if (typeof input !== 'string') return '';
+    const match = input.match(/<([^>]+)>/);
+    if (match?.[1]) return String(match[1]).trim();
+    return input.trim();
+};
+
+const canUseSendGridApiFallback = () => {
+    return Boolean(getTrimmedEnv('SENDGRID_API_KEY'));
+};
+
+const sendViaSendGridApi = async (mailOptions = {}) => {
+    const apiKey = getTrimmedEnv('SENDGRID_API_KEY');
+    if (!apiKey) {
+        throw new Error('SENDGRID_API_KEY missing for fallback');
+    }
+
+    const senderEmail = getTrimmedEnv('SENDGRID_FROM_EMAIL')
+        || extractEmailAddress(mailOptions.from)
+        || getDefaultSenderEmail();
+    const senderName = getTrimmedEnv('SENDGRID_FROM_NAME') || getTrimmedEnv('EMAIL_FROM_NAME') || 'ChatApp Support';
+
+    if (!senderEmail) {
+        throw new Error('No sender email available for SendGrid API fallback');
+    }
+
+    const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            personalizations: [{ to: [{ email: String(mailOptions.to || '').trim() }] }],
+            from: {
+                email: senderEmail,
+                name: senderName,
+            },
+            reply_to: mailOptions.replyTo ? { email: extractEmailAddress(mailOptions.replyTo) || senderEmail } : undefined,
+            subject: mailOptions.subject,
+            content: [
+                {
+                    type: 'text/html',
+                    value: mailOptions.html || '',
+                },
+            ],
+        }),
+    });
+
+    if (!response.ok) {
+        const bodyText = await response.text().catch(() => '');
+        const error = new Error(`SendGrid API fallback failed: HTTP ${response.status}`);
+        error.code = 'SENDGRID_API_ERROR';
+        error.responseCode = response.status;
+        error.command = 'SENDGRID_API';
+        error.syscall = 'fetch';
+        error.message = bodyText ? `${error.message} ${bodyText}` : error.message;
+        throw error;
+    }
+
+    return {
+        messageId: response.headers.get('x-message-id') || `sendgrid-api-${Date.now()}`,
+        accepted: [mailOptions.to],
+        rejected: [],
+        response: 'Accepted',
+    };
+};
+
 // ============================================
 // CONFIGURE TRANSPORTER BASED ON ENVIRONMENT
 // ============================================
@@ -335,6 +403,30 @@ const sendEmailWithRetry = async (transporterCandidates, mailOptions, maxRetries
 
                 throw error;
             }
+        }
+    }
+
+    // Optional fallback: for transient SMTP connectivity issues in production platforms,
+    // use SendGrid HTTPS API when configured. This avoids raw SMTP socket instability.
+    if (lastError && isTransientEmailError(lastError) && canUseSendGridApiFallback()) {
+        logger.warn('⚠️ SMTP delivery exhausted. Attempting SendGrid API fallback...', {
+            to: mailOptions?.to,
+            ...toEmailErrorMeta(lastError),
+        });
+
+        try {
+            const result = await sendViaSendGridApi(mailOptions);
+            logger.log('✅ SendGrid API fallback delivered email successfully', {
+                to: mailOptions?.to,
+                messageId: result?.messageId,
+            });
+            return result;
+        } catch (fallbackError) {
+            logger.error('❌ SendGrid API fallback failed', {
+                to: mailOptions?.to,
+                ...toEmailErrorMeta(fallbackError),
+            });
+            throw fallbackError;
         }
     }
     
