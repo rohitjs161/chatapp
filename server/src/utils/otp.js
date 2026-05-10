@@ -114,7 +114,7 @@ const getEmailTransporterCandidates = () => {
         if (emailService === 'gmail') {
             const emailUser = getTrimmedEnv('EMAIL_USER');
             const emailPassword = getTrimmedEnv('EMAIL_PASSWORD').replace(/\s+/g, '');
-            const explicitPort = parsePositiveInt(process.env.EMAIL_PORT, 0);
+            const gmailPort = 587;
 
             if (!emailUser || !emailPassword) {
                 const missingFields = [];
@@ -124,51 +124,32 @@ const getEmailTransporterCandidates = () => {
             }
 
             logger.log(`📧 Using Gmail configuration - User: ${emailUser}`);
-            logger.log(`📧 Gmail SMTP: smtp.gmail.com (port fallback: 587 -> 465, IPv4 only)`);
+            logger.log(`📧 Gmail SMTP: service=gmail, port=${gmailPort}, IPv4 only`);
             logger.log(`📧 Note: Gmail requires an App Password (not your main password). Generate one at: https://myaccount.google.com/apppasswords`);
+            logger.log('📧 Render production note: port 465 fallback removed to avoid IPv6 and TLS negotiation instability.');
             const gmailAuth = {
                 user: emailUser,
                 pass: emailPassword,
             };
 
-            const buildGmailTransport = (port) => {
-                const isImplicitTls = Number(port) === 465;
-                return nodemailer.createTransport({
-                    host: 'smtp.gmail.com',
-                    port,
-                    secure: isImplicitTls,
-                    requireTLS: !isImplicitTls,
-                    tls: {
-                        rejectUnauthorized: true,
-                        minVersion: 'TLSv1.2',
-                        servername: 'smtp.gmail.com',
-                    },
+            // Force IPv4 because Render can intermittently route Gmail SMTP over IPv6,
+            // which produces ENETUNREACH / ESOCKET / ETIMEDOUT failures in production.
+            // Use a single stable Gmail transport on port 587 to avoid fallback complexity.
+            transporters.push({
+                name: 'gmail_587',
+                transporter: nodemailer.createTransport({
+                    service: 'gmail',
+                    port: gmailPort,
                     family: 4,
-                    ...transportTimeouts,
+                    connectionTimeout: 60000,
+                    greetingTimeout: 60000,
+                    socketTimeout: 60000,
+                    tls: {
+                        rejectUnauthorized: false,
+                    },
                     auth: gmailAuth,
-                });
-            };
-
-            if (explicitPort > 0) {
-                transporters.push({
-                    name: `gmail_${explicitPort}`,
-                    transporter: buildGmailTransport(explicitPort),
-                });
-            }
-
-            if (!explicitPort || explicitPort !== 587) {
-                transporters.push({
-                    name: 'gmail_587',
-                    transporter: buildGmailTransport(587),
-                });
-            }
-
-            if (!explicitPort || explicitPort !== 465) {
-                transporters.push({
-                    name: 'gmail_465',
-                    transporter: buildGmailTransport(465),
-                });
-            }
+                }),
+            });
 
             return transporters;
         }
@@ -385,12 +366,18 @@ export const sendEmailOTP = async (email, otp) => {
             return result;
 
         } catch (sendError) {
-            logger.error('❌ Failed to send email:', {
+            const errorInfo = {
                 message: sendError.message,
                 code: sendError.code,
                 response: sendError.response,
                 responseCode: sendError.responseCode,
                 command: sendError.command,
+                errno: sendError.errno,
+                syscall: sendError.syscall,
+            };
+
+            logger.error('❌ Failed to send email:', {
+                ...errorInfo,
             });
 
             if (process.env.NODE_ENV === 'development') {
