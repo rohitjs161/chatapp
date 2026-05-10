@@ -107,7 +107,7 @@ const extractEmailAddress = (input = '') => {
 // Configured for Render production with:
 // - IPv4-only DNS resolution (family: 4)
 // - Connection pooling (pool: true, maxConnections: 5)
-// - Extended timeouts (connectionTimeout: 30s, socketTimeout: 60s)
+// - Extended timeouts (connectionTimeout: 45s, socketTimeout: 120s)
 // - TLS v1.2+ with lenient cert verification
 // - No transporter.verify() in production
 
@@ -130,6 +130,7 @@ const createGmailTransporter = () => {
         port: 587,
         secure: false,
         requireTLS: true,
+        authMethod: 'LOGIN',
         
         // Force IPv4 at both DNS resolution and socket level to avoid Render IPv6 routing issues
         family: 4,
@@ -151,23 +152,25 @@ const createGmailTransporter = () => {
         },
 
         // Production-safe timeouts (extended for Render reliability)
-        connectionTimeout: 30000,  // 30 seconds
-        greetingTimeout: 30000,    // 30 seconds
-        socketTimeout: 60000,      // 60 seconds
+        connectionTimeout: 45000,  // 45 seconds
+        greetingTimeout: 45000,    // 45 seconds
+        socketTimeout: 120000,     // 120 seconds
+
+        // Gmail on Render is more stable when the TLS server name is explicit.
+        tls: {
+            // Lenient cert verification for Render stability
+            // (Gmail's certs are valid, but connection negotiation can be flaky)
+            rejectUnauthorized: false,
+            minVersion: 'TLSv1.2',
+            servername: 'smtp.gmail.com',
+        },
 
         // Connection pool to prevent socket exhaustion
         pool: true,
         maxConnections: 5,         // Limit concurrent SMTP connections
         maxMessages: 100,          // Max emails per connection
         rateLimit: 5,              // Emails per second
-
-        // TLS configuration for production reliability
-        tls: {
-            // Lenient cert verification for Render stability
-            // (Gmail's certs are valid, but connection negotiation can be flaky)
-            rejectUnauthorized: false,
-            minVersion: 'TLSv1.2',
-        },
+        keepAlive: true,
 
         // Authentication
         auth: {
@@ -179,6 +182,7 @@ const createGmailTransporter = () => {
         logger: false,      // Nodemailer internal logging (we use our logger)
         debug: false,       // No SMTP protocol debugging
         transactionLog: false, // Reduce memory usage
+        dnsTimeout: 30000,
     });
 };
 
@@ -245,7 +249,7 @@ const sendEmailWithRetry = async (mailOptions, maxRetries = 3) => {
 
             if (isNetworkError && hasRetriesLeft) {
                 // Exponential backoff: 1s, 2s, 4s, then capped at 5s
-                const delayMs = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+                const delayMs = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
                 logger.warn(`⚠️ Transient network error on attempt ${attempt}, retrying in ${delayMs}ms...`, {
                     ...toEmailErrorMeta(error),
                 });
@@ -270,6 +274,17 @@ const sendEmailWithRetry = async (mailOptions, maxRetries = 3) => {
 
     // All retries exhausted for transient error
     throw lastError;
+};
+
+const isConnectionTimeoutError = (error = {}) => {
+    const code = String(error?.code || '').toUpperCase();
+    const command = String(error?.command || '').toUpperCase();
+
+    return code === 'ETIMEDOUT'
+        || code === 'ESOCKETTIMEDOUT'
+        || command === 'CONN'
+        || command === 'EHLO'
+        || command === 'STARTTLS';
 };
 // ============================================
 // CREATE MAIL OPTIONS (Reusable Helper)
@@ -358,6 +373,13 @@ const sendEmail = async (email, subject, htmlContent, action, context = 'email')
             email: email,
             ...toEmailErrorMeta(error),
         });
+
+        if (isConnectionTimeoutError(error)) {
+            logger.error('⏱️ SMTP timeout detected while delivering Gmail email. The transporter now uses IPv4-only DNS, pooled connections, and extended Render-safe timeouts.', {
+                email,
+                action,
+            });
+        }
 
         // Log error for analytics (production only)
         if (process.env.NODE_ENV === 'production') {
