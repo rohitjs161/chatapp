@@ -12,10 +12,17 @@ app.disable("x-powered-by");
 app.set("trust proxy", 1);
 
 const parseAllowedOrigins = () => {
-    const raw = process.env.CORS_ORIGIN || "";
+    const raw = [
+        process.env.CORS_ORIGIN || "",
+        process.env.FRONTEND_URL || "",
+        process.env.CLIENT_URL || "",
+        process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "",
+    ].join(",");
+
     return raw
         .split(",")
-        .map((origin) => origin.trim())
+    .map((origin) => origin.trim())
+    .map((origin) => origin.replace(/\/+$/, ""))
         .filter(Boolean);
 };
 
@@ -31,7 +38,19 @@ app.use(cors({
             return;
         }
 
-        if (allowedOrigins.includes(origin)) {
+        const normalizedOrigin = String(origin).trim().replace(/\/+$/, "");
+
+        if (process.env.NODE_ENV === "production" && normalizedOrigin.endsWith(".vercel.app")) {
+            callback(null, true);
+            return;
+        }
+
+        if (process.env.NODE_ENV !== "production" && (normalizedOrigin.includes("localhost") || normalizedOrigin.includes("127.0.0.1"))) {
+            callback(null, true);
+            return;
+        }
+
+        if (allowedOrigins.includes(normalizedOrigin)) {
             callback(null, true);
             return;
         }
@@ -44,6 +63,9 @@ app.use(cors({
     allowedHeaders: ["Content-Type", "Authorization"],
     optionsSuccessStatus: 200,
 }));
+
+// Make sure preflight requests are answered before route handlers.
+app.options(/.*/, cors());
 
 // Force HTTPS redirect in production
 if (process.env.NODE_ENV === "production") {

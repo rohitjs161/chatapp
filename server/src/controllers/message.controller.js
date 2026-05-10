@@ -5,8 +5,7 @@ import { asyncHandler } from "../utils/asyncHandler.js";
 import { apiError } from "../utils/apiError.js";
 import { apiResponse } from "../utils/apiResponse.js";
 import { uploadOnCloudinary, deleteFromCloudinary } from "../utils/cloudinary.js";
-import { io } from "../index.js";
-import { emitToUserRoom } from "../socket/io.js";
+import { emitToUserRoom, getSocketServer } from "../socket/io.js";
 import { logger } from "../utils/logger.js";
 import {
     expireConversationIfNeeded,
@@ -21,6 +20,8 @@ import {
 
 // Validate MongoDB ObjectId
 const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
+
+const getIo = () => getSocketServer();
 
 // Validate conversation exists and user is participant
 const validateConversationAccess = async (conversationId, userId) => {
@@ -148,7 +149,7 @@ const emitMessageToParticipants = async (conversation, message) => {
             logger.warn(`⚠️ Attempted to emit message to non-participant: ${participantId}`);
             return;
         }
-        io.to(`user:${participantId}`).emit("receive-message", serializedMessage);
+        getIo()?.to(`user:${participantId}`).emit("receive-message", serializedMessage);
     });
 };
 
@@ -442,7 +443,7 @@ const editMessage = asyncHandler(async (req, res) => {
     const uniqueParticipantIds = [...new Set(participantIds)];
 
     uniqueParticipantIds.forEach((participantId) => {
-        io.to(`user:${participantId}`).emit("message-edited", serializedMessage);
+        getIo()?.to(`user:${participantId}`).emit("message-edited", serializedMessage);
     });
 
     return res.status(200).json(
@@ -508,7 +509,7 @@ const deleteMessage = asyncHandler(async (req, res) => {
     const uniqueParticipantIds = [...new Set(participantIds)];
 
     uniqueParticipantIds.forEach((participantId) => {
-        io.to(`user:${participantId}`).emit("message-deleted", {
+        getIo()?.to(`user:${participantId}`).emit("message-deleted", {
             messageId,
             conversationId: message.conversation.toString(),
         });
@@ -580,7 +581,7 @@ const markAsRead = asyncHandler(async (req, res) => {
     });
 
     // Emit real-time read event to conversation room
-    io.to(conversationId).emit("messages-read", {
+    getIo()?.to(conversationId).emit("messages-read", {
         conversationId,
         userId,
         messageIds,
