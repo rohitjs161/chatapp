@@ -8,7 +8,7 @@
  * 
  * This will:
  * 1. Check if email configuration exists
- * 2. Initialize the Resend client
+ * 2. Initialize the Brevo transactional email client
  * 3. Validate the configured sender details
  * 4. Send a test email to your configured email address
  */

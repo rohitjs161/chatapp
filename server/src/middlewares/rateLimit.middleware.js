@@ -28,12 +28,12 @@ export const registerLimiter = createRateLimiter(
 );
 
 export const signupEmailVerifyLimiter = createRateLimiter(
-    15, 10,
+    15, 5,
     "Too many signup email verification attempts. Please try again after 15 minutes."
 );
 
 export const signupEmailResendLimiter = createRateLimiter(
-    15, 30,
+    15, 3,
     "Too many signup OTP resend requests. Please wait and try again."
 );
 
@@ -76,17 +76,17 @@ export const forgotPasswordSendOtpLimiter = createRateLimiter(
 );
 
 export const forgotPasswordVerifyOtpLimiter = createRateLimiter(
-    15, 10,
+    15, 5,
     "Too many password reset attempts. Please try again after 15 minutes."
 );
 
 export const forgotPasswordResendOtpLimiter = createRateLimiter(
-    15, 30,
+    15, 3,
     "Too many password reset OTP resend requests. Please wait and try again."
 );
 
 export const verifyEmailChangeLimiter = createRateLimiter(
-    15, 10,
+    15, 5,
     "Too many profile email verification attempts. Please try again after 15 minutes."
 );
 

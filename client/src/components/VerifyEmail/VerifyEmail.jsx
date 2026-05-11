@@ -30,6 +30,7 @@ const VerifyEmail = () => {
   const location = useLocation();
   const email = location.state?.email;
   const initialEmailSent = location.state?.emailSent !== false; // Default to true if not specified
+  const initialDeliveryStatus = location.state?.deliveryStatus || (initialEmailSent ? 'sent' : 'failed');
   const flowType = location.pathname === '/verify-email-change' ? 'email-change' : 'signup';
   const { updateUser, user } = useAuthStore();
   const { isLocked: isSubmitting, runLockedAction } = useActionLock();
@@ -46,7 +47,7 @@ const VerifyEmail = () => {
   const [resendTimer, setResendTimer] = useState(initialResendRemaining);
   const [resendNotice, setResendNotice] = useState('');
   const [otpLocked, setOtpLocked] = useState(false);
-  const [deliveryState, setDeliveryState] = useState(initialEmailSent ? 'sent' : 'failed');
+  const [deliveryState, setDeliveryState] = useState(initialDeliveryStatus);
   const inputRefs = useRef([]);
   const resendToastTimerRef = useRef(null);
   const [resendAvailableAt, setResendAvailableAt] = useState(initialResendAvailableAt);
@@ -95,14 +96,6 @@ const VerifyEmail = () => {
       }
     };
   }, [resendNotice]);
-
-  useEffect(() => {
-    if (flowType !== 'signup' || initialEmailSent) {
-      return;
-    }
-
-    setDeliveryState('failed');
-  }, [flowType, initialEmailSent]);
 
   const handleOtpChange = (index, value) => {
     if (otpLocked) return;
@@ -210,9 +203,10 @@ const VerifyEmail = () => {
       }
 
       const emailDelivered = response?.data?.emailSent !== false;
+      const responseDeliveryStatus = response?.data?.deliveryStatus || (emailDelivered ? 'sent' : 'failed');
 
       if (response?.success === false || !emailDelivered) {
-        setDeliveryState('failed');
+        setDeliveryState(responseDeliveryStatus === 'sandbox_blocked' ? 'sandbox_blocked' : 'failed');
 
         const blockedUntil = response?.data?.blockedUntil ? new Date(response.data.blockedUntil).getTime() : null;
         if (blockedUntil && blockedUntil > Date.now()) {
@@ -264,6 +258,12 @@ const VerifyEmail = () => {
             </div>
           )}
 
+          {deliveryState === 'sandbox_blocked' && (
+            <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-800 shadow-sm">
+              OTP was generated, but Resend sandbox blocks delivery to external email addresses. Check the server logs for the OTP, or verify a Resend domain to enable real delivery.
+            </div>
+          )}
+
           {deliveryState === 'failed' && (
             <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-800 shadow-sm">
               ⚠️ The verification email could not be delivered. Please click "Resend OTP" below to send it again.
@@ -280,6 +280,8 @@ const VerifyEmail = () => {
             <p className="mt-2 text-sm text-slate-600">
               {deliveryState === 'sent' ? (
                 <>We've sent a 6-digit OTP to<br /></>
+              ) : deliveryState === 'sandbox_blocked' ? (
+                <>We generated a 6-digit OTP, but delivery is blocked in the Resend sandbox.<br /></>
               ) : (
                 <>Once you receive the OTP, enter it below.<br /></>
               )}

@@ -171,7 +171,13 @@ const SignUp = () => {
 
         try {
           const response = await register(payload);
-          navigate('/verify-otp', { state: { email: payload.email, emailSent: response?.data?.emailSent } });
+          navigate('/verify-otp', {
+            state: {
+              email: payload.email,
+              emailSent: response?.data?.emailSent,
+              deliveryStatus: response?.data?.deliveryStatus,
+            },
+          });
         } catch (err) {
           if (!err?.response) {
             setErrors(prev => ({ ...prev, email: getSignupNetworkErrorMessage() }));

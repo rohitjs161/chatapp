@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { Resend } from 'resend';
+import { BrevoClient } from '@getbrevo/brevo';
 import { apiError } from './apiError.js';
 import { logger } from './logger.js';
 
@@ -10,7 +10,7 @@ const DEFAULT_FORGOT_PASSWORD_SUBJECT = 'Reset Your Password - ChatApp';
 const MAX_EMAIL_SEND_RETRIES = 3;
 const RETRY_DELAYS_MS = [1000, 2000, 4000];
 
-let resendClient = null;
+let brevoTransactionalClient = null;
 
 const getTrimmedEnv = (name) => {
     const value = process.env[name];
@@ -26,6 +26,11 @@ const isValidEmailAddress = (value = '') => EMAIL_REGEX.test(String(value || '')
 
 const normalizeEmailAddress = (value = '') => String(value || '').trim();
 
+const extractOtpFromHtml = (htmlContent = '') => {
+    const matches = String(htmlContent || '').match(/\b\d{6}\b/);
+    return matches?.[0] || null;
+};
+
 const toEmailErrorMeta = (error = {}) => ({
     name: error?.name,
     message: error?.message,
@@ -35,22 +40,27 @@ const toEmailErrorMeta = (error = {}) => ({
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-export const getResendClient = () => {
-    if (resendClient) {
-        return resendClient;
+/**
+ * Get or initialize the Brevo transactional email client
+ * @returns {BrevoClient} Brevo client instance
+ * @throws {apiError} If API key is missing
+ */
+export const getBrevoClient = () => {
+    if (brevoTransactionalClient) {
+        return brevoTransactionalClient;
     }
 
-    const apiKey = getTrimmedEnv('RESEND_API_KEY');
+    const apiKey = getTrimmedEnv('BREVO_API_KEY');
 
-    if (!apiKey || !apiKey.startsWith('re_')) {
-        logger.error('❌ RESEND_API_KEY is missing or invalid');
+    if (!apiKey) {
+        logger.error('❌ BREVO_API_KEY is missing');
         throw new apiError(500, 'Failed to send email. Please try again later.');
     }
 
-    resendClient = new Resend(apiKey);
-    logger.log('📧 Resend initialized');
+    brevoTransactionalClient = new BrevoClient({ apiKey });
+    logger.log('📧 Brevo transactional email client initialized');
 
-    return resendClient;
+    return brevoTransactionalClient;
 };
 
 const getSenderConfig = () => {
@@ -91,29 +101,41 @@ export const buildMailOptions = ({ email, subject, htmlContent }) => {
     const { fromEmail, fromName, replyTo } = getSenderConfig();
 
     return {
-        from: `${fromName} <${fromEmail}>`,
-        to: [recipientEmail],
+        sender: {
+            email: fromEmail,
+            name: fromName,
+        },
+        to: [{ email: recipientEmail }],
         subject,
-        html: htmlContent,
-        replyTo,
+        htmlContent,
+        replyTo: {
+            email: replyTo,
+        },
     };
 };
 
-const getResendStatusCode = (error = {}) => {
-    const statusCode = Number(error?.statusCode ?? error?.status ?? error?.response?.status);
+const getBrevoStatusCode = (error = {}) => {
+    const statusCode = Number(error?.response?.status ?? error?.statusCode ?? error?.status);
     return Number.isFinite(statusCode) ? statusCode : 0;
 };
 
-const isTransientResendError = (error = {}) => {
-    const statusCode = getResendStatusCode(error);
+/**
+ * Check if an error is transient and should trigger a retry
+ * @param {Error} error - The error to check
+ * @returns {boolean} True if error is transient
+ */
+const isTransientBrevoError = (error = {}) => {
+    const statusCode = getBrevoStatusCode(error);
     const code = String(error?.code || error?.name || '').toUpperCase();
     const message = String(error?.message || '').toLowerCase();
     const causeMessage = String(error?.cause?.message || '').toLowerCase();
 
+    // Don't retry on client errors (4xx) that indicate configuration issues
     if ([400, 401, 403, 404, 422].includes(statusCode)) {
         return false;
     }
 
+    // Don't retry on authentication/authorization errors
     if (message.includes('invalid api key')
         || message.includes('unauthorized')
         || message.includes('forbidden')
@@ -126,10 +148,12 @@ const isTransientResendError = (error = {}) => {
         return false;
     }
 
+    // Retry on server errors and rate limits
     if (statusCode === 429 || statusCode >= 500) {
         return true;
     }
 
+    // Retry on network errors
     return [
         'ECONNRESET',
         'ECONNREFUSED',
@@ -151,49 +175,44 @@ const isTransientResendError = (error = {}) => {
         || causeMessage.includes('socket');
 };
 
+/**
+ * Send email with retry logic for transient failures
+ * @param {Object} mailOptions - Mail options from buildMailOptions
+ * @param {number} maxRetries - Maximum retry attempts
+ * @returns {Promise<Object>} Brevo API response
+ * @throws {Error} If all retry attempts fail
+ */
 export const sendEmailWithRetry = async (mailOptions, maxRetries = MAX_EMAIL_SEND_RETRIES) => {
     let lastError;
 
     for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
-        const client = getResendClient();
+        const client = getBrevoClient();
 
         try {
-            logger.log(`📧 Attempt ${attempt}/${maxRetries} to send email to: ${mailOptions.to?.[0] || mailOptions.to}`);
+            logger.log(`📧 Attempt ${attempt}/${maxRetries} to send email to: ${mailOptions.to?.[0]?.email || 'unknown'}`);
 
-            const result = await client.emails.send(mailOptions);
+            const result = await client.transactionalEmails.sendTransacEmail(mailOptions);
 
-            if (result?.error) {
-                const resendError = result.error instanceof Error
-                    ? result.error
-                    : Object.assign(new Error(result.error?.message || 'Resend request failed'), result.error);
-
-                if (result.error?.statusCode && !resendError.statusCode) {
-                    resendError.statusCode = result.error.statusCode;
-                }
-
-                throw resendError;
-            }
-
-            logger.log(`✅ Resend email sent successfully to ${mailOptions.to?.[0] || mailOptions.to} | Message ID: ${result?.data?.id || 'unknown'}`);
+            logger.log(`✅ Brevo email sent successfully to ${mailOptions.to?.[0]?.email || 'unknown'} | Message ID: ${result?.messageId || 'unknown'}`);
             return result;
         } catch (error) {
             lastError = error;
-            const statusCode = getResendStatusCode(error);
-            const transient = isTransientResendError(error);
+            const statusCode = getBrevoStatusCode(error);
+            const transient = isTransientBrevoError(error);
             const hasRetriesLeft = attempt < maxRetries;
 
             if (transient && hasRetriesLeft) {
                 const delayMs = RETRY_DELAYS_MS[attempt - 1] || RETRY_DELAYS_MS[RETRY_DELAYS_MS.length - 1];
                 logger.warn(`⚠️ Retrying email delivery in ${delayMs}ms`, {
                     ...toEmailErrorMeta(error),
-                    email: mailOptions.to?.[0] || mailOptions.to,
+                    email: mailOptions.to?.[0]?.email || 'unknown',
                 });
                 await sleep(delayMs);
                 continue;
             }
 
             logger.error('❌ Failed to send email', {
-                email: mailOptions.to?.[0] || mailOptions.to,
+                email: mailOptions.to?.[0]?.email || 'unknown',
                 statusCode,
                 ...toEmailErrorMeta(error),
             });
@@ -318,7 +337,7 @@ const getEmailTemplate = (otp) => {
     `;
 };
 
-export const sendEmail = async ({ email, subject, htmlContent, action, context = 'email' }) => {
+export const sendEmail = async ({ email, subject, htmlContent, action, context = 'email', debugOtp = null }) => {
     const recipientEmail = normalizeEmailAddress(email);
 
     try {
@@ -335,7 +354,7 @@ export const sendEmail = async ({ email, subject, htmlContent, action, context =
                 email: recipientEmail,
                 action,
                 status: 'success',
-                messageId: result?.data?.id || null,
+                messageId: result?.messageId || null,
                 context,
             });
         }
@@ -375,6 +394,12 @@ export const compareOTP = (inputOTP, storedHashedOTP) => {
     return hashedInputOTP === storedHashedOTP;
 };
 
+/**
+ * Send password reset OTP email
+ * @param {string} email - Recipient email
+ * @param {string} otp - One-time password
+ * @returns {Promise<Object>} Brevo API response
+ */
 export const sendEmailOTP = async (email, otp) => {
     const subject = getTrimmedEnv('EMAIL_SUBJECT_FORGOT_PASSWORD') || DEFAULT_FORGOT_PASSWORD_SUBJECT;
     const htmlContent = getEmailTemplate(otp);
@@ -382,11 +407,18 @@ export const sendEmailOTP = async (email, otp) => {
         email,
         subject,
         htmlContent,
+        debugOtp: otp,
         action: 'password_reset_otp',
         context: 'forgot-password',
     });
 };
 
+/**
+ * Send email verification OTP
+ * @param {string} email - Recipient email
+ * @param {string} otp - One-time password
+ * @returns {Promise<Object>} Brevo API response
+ */
 export const sendEmailVerification = async (email, otp) => {
     const subject = getTrimmedEnv('EMAIL_SUBJECT_VERIFY_EMAIL') || DEFAULT_VERIFY_SUBJECT;
     const htmlContent = getVerificationTemplate(otp);
@@ -394,25 +426,34 @@ export const sendEmailVerification = async (email, otp) => {
         email,
         subject,
         htmlContent,
+        debugOtp: otp,
         action: 'email_verification',
         context: 'email-change',
     });
 };
 
+/**
+ * Health check for Brevo email configuration
+ * @returns {Promise<boolean>} True if configuration is valid
+ */
 export const verifyTransporterHealth = async () => {
     try {
-        getResendClient();
+        getBrevoClient();
         const { fromEmail } = getSenderConfig();
-        logger.log('✅ Resend email configuration is ready', { fromEmail });
+        logger.log('✅ Brevo email configuration is ready', { fromEmail });
         return true;
     } catch (error) {
-        logger.error('❌ Resend health check failed', toEmailErrorMeta(error));
+        logger.error('❌ Brevo health check failed', toEmailErrorMeta(error));
         return false;
     }
 };
 
+/**
+ * Test Brevo email configuration by sending a test email
+ * @returns {Promise<boolean>} True if test email was sent successfully
+ */
 export const testEmailConfiguration = async () => {
-    console.log('\n🧪 Testing Resend Configuration...\n');
+    console.log('\n🧪 Testing Brevo Configuration...\n');
 
     try {
         const { fromEmail, fromName } = getSenderConfig();
@@ -422,18 +463,18 @@ export const testEmailConfiguration = async () => {
         console.log(`📧 Test recipient: ${probeEmail}`);
         console.log(`📧 Node Environment: ${process.env.NODE_ENV || 'development'}`);
 
-        await sendEmail({
+        const result = await sendEmail({
             email: probeEmail,
-            subject: 'ChatApp - Resend Configuration Test',
-            htmlContent: '<h1>✅ Resend Configuration Works!</h1><p>You can now use ChatApp email features.</p>',
+            subject: 'ChatApp - Brevo Configuration Test',
+            htmlContent: '<h1>✅ Brevo Configuration Works!</h1><p>You can now use ChatApp email features.</p>',
             action: 'configuration_test',
             context: 'diagnostic',
         });
 
-        console.log('\n🎉 Resend configuration is working correctly!\n');
+        console.log('\n🎉 Brevo configuration is working correctly!\n');
         return true;
     } catch (error) {
-        console.error('\n❌ Resend configuration test failed!');
+        console.error('\n❌ Brevo configuration test failed!');
         console.error(`Error: ${error.message}\n`);
         console.error('Debugging info:');
         console.error(`Name: ${error?.name}`);

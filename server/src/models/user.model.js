@@ -114,6 +114,10 @@ const userSchema = new Schema({
         type: Number,
         default: 0,
     },
+    resetPasswordBlockedUntil: {
+        type: Date,
+        default: null,
+    },
     resetPasswordOtpResendAttempts: {
         type: Number,
         default: 0,
@@ -133,6 +137,10 @@ const userSchema = new Schema({
     deleteAccountAttempts: {
         type: Number,
         default: 0,
+    },
+    deleteAccountBlockedUntil: {
+        type: Date,
+        default: null,
     },
     deleteAccountOtpResendAttempts: {
         type: Number,
@@ -154,8 +162,11 @@ const userSchema = new Schema({
     emailVerificationAttempts: {
         type: Number,
         default: 0,
-    }
-    ,
+    },
+    emailVerificationBlockedUntil: {
+        type: Date,
+        default: null,
+    },
     // Pending email change fields (used for secure email update flow)
     pendingEmail: {
         type: String,

@@ -41,11 +41,12 @@ const MAX_RESET_PASSWORD_OTP_RESEND_ATTEMPTS = 3;
 const RESET_PASSWORD_OTP_RESEND_BLOCK_HOURS = 1;
 const EMAIL_CHANGE_OTP_RESEND_COOLDOWN_SECONDS = 30;
 const MAX_EMAIL_CHANGE_OTP_ATTEMPTS = 5;
-const MAX_EMAIL_CHANGE_OTP_RESEND_ATTEMPTS = 5;
+const MAX_EMAIL_CHANGE_OTP_RESEND_ATTEMPTS = 3;
 const EMAIL_CHANGE_OTP_RESEND_BLOCK_HOURS = 24;
 const MAX_DELETE_ACCOUNT_OTP_ATTEMPTS = 5;
 const MAX_DELETE_ACCOUNT_OTP_RESEND_ATTEMPTS = 3;
 const DELETE_ACCOUNT_OTP_RESEND_BLOCK_HOURS = 24;
+const OTP_VALIDATION_BLOCK_MINUTES = 15;
 const EMAIL_DELIVERY_RESPONSE_TIMEOUT_MS = Math.max(
     1000,
     Number.parseInt(process.env.EMAIL_DELIVERY_RESPONSE_TIMEOUT_MS || '5000', 10) || 5000
@@ -53,12 +54,46 @@ const EMAIL_DELIVERY_RESPONSE_TIMEOUT_MS = Math.max(
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const getValidationBlockedUntil = () => new Date(Date.now() + OTP_VALIDATION_BLOCK_MINUTES * 60 * 1000);
+
+const getBlockedMinutesRemaining = (blockedUntil) => {
+    if (!blockedUntil) {
+        return 0;
+    }
+
+    const blockedUntilMs = new Date(blockedUntil).getTime();
+    if (!Number.isFinite(blockedUntilMs)) {
+        return 0;
+    }
+
+    return Math.max(0, Math.ceil((blockedUntilMs - Date.now()) / (1000 * 60)));
+};
+
+const isBlockActive = (blockedUntil) => {
+    const blockedUntilMs = new Date(blockedUntil || 0).getTime();
+    return Number.isFinite(blockedUntilMs) && blockedUntilMs > Date.now();
+};
+
+const OTP_RESPONSE_MESSAGES = {
+    sent: 'OTP has been sent to your email. Please check your inbox.',
+    queued: 'OTP delivery is in progress. If you do not receive it shortly, try again.',
+    sandboxBlocked: 'OTP was generated, but it was not delivered because Resend sandbox blocks external recipients. Verify a domain to enable delivery.',
+    genericPending: 'If an account with this email exists, a new OTP has been sent.',
+};
+
+const logOtpResendState = (label, details) => {
+    logger.log(`📨 ${label}`, details);
+};
+
 const sendVerificationEmailWithBudget = async ({ email, otp, context = 'signup' }) => {
     const timeoutToken = Symbol('email_send_timeout');
     const sendPromise = sendEmailVerification(email, otp);
 
     const outcome = await Promise.race([
-        sendPromise.then(() => ({ status: 'sent' })).catch((error) => ({ status: 'failed', error })),
+        sendPromise.then((result) => ({
+            status: result?.sandboxFallback ? 'sandbox_fallback' : 'sent',
+            result,
+        })).catch((error) => ({ status: 'failed', error })),
         wait(EMAIL_DELIVERY_RESPONSE_TIMEOUT_MS).then(() => timeoutToken),
     ]);
 
@@ -414,6 +449,24 @@ const registerUser = asyncHandler(async (req, res) => {
                 || activePendingRegistrations.find((record) => record.username === usernameNormalized)
                 || activePendingRegistrations[0];
 
+            if (isBlockActive(preferredPending.emailVerificationBlockedUntil)) {
+                const minutesRemaining = getBlockedMinutesRemaining(preferredPending.emailVerificationBlockedUntil);
+                return res.status(200).json(
+                    new apiResponse(
+                        200,
+                        {
+                            email: emailNormalized,
+                            username: usernameNormalized,
+                            verificationPending: true,
+                            emailSent: false,
+                            otpResent: false,
+                        },
+                        `Too many invalid OTP attempts. Please try again after ${minutesRemaining} minute${minutesRemaining > 1 ? 's' : ''}.`,
+                        'rate_limited'
+                    )
+                );
+            }
+
             const staleActiveRecords = activePendingRegistrations.filter(
                 (record) => String(record._id) !== String(preferredPending._id)
             );
@@ -438,6 +491,11 @@ const registerUser = asyncHandler(async (req, res) => {
             pendingRegistration.otpResendAvailableAt = getNextResendAvailableAt();
             await pendingRegistration.save();
 
+            logOtpResendState('Signup OTP state reset', {
+                email: emailNormalized,
+                resendAttempts: pendingRegistration.otpResendAttempts,
+            });
+
             const emailDispatch = await sendVerificationEmailWithBudget({
                 email: emailNormalized,
                 otp: verificationOTP,
@@ -455,8 +513,9 @@ const registerUser = asyncHandler(async (req, res) => {
                             username: usernameNormalized,
                             otpResent: true,
                             emailSent: true,
+                            deliveryStatus: 'sent',
                         },
-                        'OTP resent. Please verify your email.'
+                        OTP_RESPONSE_MESSAGES.sent
                     )
                 );
             }
@@ -476,8 +535,31 @@ const registerUser = asyncHandler(async (req, res) => {
                             verificationPending: true,
                             otpResent: true,
                             emailSent: false,
+                            deliveryStatus: 'queued',
                         },
-                        'Account saved. OTP delivery is in progress. If you do not receive it shortly, use "Resend OTP".'
+                        OTP_RESPONSE_MESSAGES.queued
+                    )
+                );
+            }
+
+            if (emailDispatch.status === 'sandbox_fallback') {
+                logger.warn('⚠️ Verification email could not be delivered in the Resend sandbox for existing pending registration', {
+                    email: emailNormalized,
+                    from: process.env.EMAIL_FROM,
+                });
+
+                return res.status(200).json(
+                    new apiResponse(
+                        200,
+                        {
+                            email: emailNormalized,
+                            username: usernameNormalized,
+                            verificationPending: true,
+                            otpResent: true,
+                            emailSent: false,
+                            deliveryStatus: 'sandbox_blocked',
+                        },
+                        OTP_RESPONSE_MESSAGES.sandboxBlocked
                     )
                 );
             }
@@ -498,8 +580,9 @@ const registerUser = asyncHandler(async (req, res) => {
                             verificationPending: true,
                             otpResent: false,
                             emailSent: false,
+                            deliveryStatus: 'failed',
                         },
-                        'Account saved. Verification email could not be delivered. Please check your email or use "Resend OTP" to try again.'
+                        OTP_RESPONSE_MESSAGES.sandboxBlocked
                     )
                 );
             }
@@ -535,8 +618,9 @@ const registerUser = asyncHandler(async (req, res) => {
                         username: usernameNormalized,
                         verificationPending: true,
                         emailSent: true,
+                        deliveryStatus: 'sent',
                     },
-                    'Account created successfully. Please verify your email with the OTP sent to your inbox.'
+                    OTP_RESPONSE_MESSAGES.sent
                 )
             );
         }
@@ -555,8 +639,30 @@ const registerUser = asyncHandler(async (req, res) => {
                         username: usernameNormalized,
                         verificationPending: true,
                         emailSent: false,
+                        deliveryStatus: 'queued',
                     },
-                    'Account created successfully. OTP delivery is in progress. If you do not receive it shortly, use "Resend OTP".'
+                    OTP_RESPONSE_MESSAGES.queued
+                )
+            );
+        }
+
+        if (emailDispatch.status === 'sandbox_fallback') {
+            logger.warn('⚠️ Verification email could not be delivered in the Resend sandbox for new pending registration', {
+                email: emailNormalized,
+                from: process.env.EMAIL_FROM,
+            });
+
+            return res.status(200).json(
+                new apiResponse(
+                    200,
+                    {
+                        email: emailNormalized,
+                        username: usernameNormalized,
+                        verificationPending: true,
+                        emailSent: false,
+                        deliveryStatus: 'sandbox_blocked',
+                    },
+                    OTP_RESPONSE_MESSAGES.sandboxBlocked
                 )
             );
         }
@@ -576,8 +682,9 @@ const registerUser = asyncHandler(async (req, res) => {
                         username: usernameNormalized,
                         verificationPending: true,
                         emailSent: false,
+                        deliveryStatus: 'failed',
                     },
-                    'Account created successfully. Verification email could not be delivered. Please check your email or use "Resend OTP" to send it again.'
+                    OTP_RESPONSE_MESSAGES.sandboxBlocked
                 )
             );
         }
@@ -780,6 +887,18 @@ const deleteAccount = asyncHandler(async (req, res) => {
         const { otp, resendOtp } = req.body || {};
 
         if (resendOtp === true || !otp) {
+            if (isBlockActive(user.deleteAccountBlockedUntil)) {
+                const minutesRemaining = getBlockedMinutesRemaining(user.deleteAccountBlockedUntil);
+                return res.status(200).json(
+                    new apiResponse(
+                        200,
+                        null,
+                        `Too many invalid OTP attempts. Please try again after ${minutesRemaining} minute${minutesRemaining > 1 ? 's' : ''}.`,
+                        'rate_limited'
+                    )
+                );
+            }
+
             // Check if resend attempts exceeded
             if (user.deleteAccountOtpResendAttempts >= MAX_DELETE_ACCOUNT_OTP_RESEND_ATTEMPTS) {
                 if (user.deleteAccountOtpResendBlockedUntil && new Date() < user.deleteAccountOtpResendBlockedUntil) {
@@ -806,6 +925,7 @@ const deleteAccount = asyncHandler(async (req, res) => {
             user.deleteAccountOTP = hashedDeleteOtp;
             user.deleteAccountOTPExpiry = otpExpiry;
             user.deleteAccountAttempts = 0;
+            user.deleteAccountBlockedUntil = null;
             user.deleteAccountOtpResendAttempts = (user.deleteAccountOtpResendAttempts || 0) + 1;
 
             // If this is the 3rd resend, block future resends for 24 hours
@@ -815,13 +935,35 @@ const deleteAccount = asyncHandler(async (req, res) => {
 
             await user.save({ validateBeforeSave: false });
 
-            await sendEmailOTP(user.email, deleteOtp);
+            logOtpResendState('Delete-account OTP resend incremented', {
+                userId: String(userId),
+                email: user.email,
+                resendAttempts: user.deleteAccountOtpResendAttempts,
+                blockedUntil: user.deleteAccountOtpResendBlockedUntil,
+            });
+
+            const deleteEmailResult = await sendEmailOTP(user.email, deleteOtp);
+
+            if (deleteEmailResult?.sandboxFallback) {
+                logger.warn('⚠️ Delete-account OTP generated but Resend sandbox blocked delivery', {
+                    email: user.email,
+                    resendAttempts: user.deleteAccountOtpResendAttempts,
+                });
+
+                return res.status(200).json(
+                    new apiResponse(
+                        200,
+                        { requiresDeleteOtp: true, emailSent: false, verificationPending: true },
+                        'OTP was generated, but it was not delivered because Resend sandbox blocks external recipients. Verify a domain to enable delivery.'
+                    )
+                );
+            }
 
             return res.status(200).json(
                 new apiResponse(
                     200,
                     { requiresDeleteOtp: true },
-                    'A verification OTP was sent to your email. Enter OTP to confirm account deletion.'
+                    OTP_RESPONSE_MESSAGES.sent
                 )
             );
         }
@@ -838,25 +980,44 @@ const deleteAccount = asyncHandler(async (req, res) => {
             user.deleteAccountOTP = null;
             user.deleteAccountOTPExpiry = null;
             user.deleteAccountAttempts = 0;
+            user.deleteAccountBlockedUntil = null;
             await user.save({ validateBeforeSave: false });
             throw new apiError(400, 'Delete OTP has expired. Please request a new OTP.');
         }
 
+        if (isBlockActive(user.deleteAccountBlockedUntil)) {
+            const minutesRemaining = getBlockedMinutesRemaining(user.deleteAccountBlockedUntil);
+            return res.status(200).json(
+                new apiResponse(
+                    200,
+                    null,
+                    `Too many invalid OTP attempts. Please try again after ${minutesRemaining} minute${minutesRemaining > 1 ? 's' : ''}.`,
+                    'rate_limited'
+                )
+            );
+        }
+
         if ((user.deleteAccountAttempts || 0) >= MAX_DELETE_ACCOUNT_OTP_ATTEMPTS) {
-            user.deleteAccountOTP = null;
-            user.deleteAccountOTPExpiry = null;
-            user.deleteAccountAttempts = 0;
+            user.deleteAccountBlockedUntil = getValidationBlockedUntil();
             await user.save({ validateBeforeSave: false });
             return res.status(200).json(
-                new apiResponse(200, null, 'Too many invalid OTP attempts. Please request a new OTP.', 'rate_limited')
+                new apiResponse(200, null, `Maximum verification attempts exceeded. Please try again after ${OTP_VALIDATION_BLOCK_MINUTES} minutes.`, 'rate_limited')
             );
         }
 
         const isOtpValid = compareOTP(String(otp).trim(), user.deleteAccountOTP);
         if (!isOtpValid) {
             user.deleteAccountAttempts = (user.deleteAccountAttempts || 0) + 1;
-            await user.save({ validateBeforeSave: false });
             const remaining = MAX_DELETE_ACCOUNT_OTP_ATTEMPTS - user.deleteAccountAttempts;
+            if (remaining <= 0) {
+                user.deleteAccountBlockedUntil = getValidationBlockedUntil();
+                await user.save({ validateBeforeSave: false });
+                return res.status(200).json(
+                    new apiResponse(200, null, `Maximum verification attempts exceeded. Please try again after ${OTP_VALIDATION_BLOCK_MINUTES} minutes.`, 'rate_limited')
+                );
+            }
+
+            await user.save({ validateBeforeSave: false });
             return res.status(200).json(
                 new apiResponse(200, null, `Invalid OTP. ${remaining} attempt${remaining > 1 ? 's' : ''} remaining.`, 'error')
             );
@@ -865,6 +1026,7 @@ const deleteAccount = asyncHandler(async (req, res) => {
         user.deleteAccountOTP = null;
         user.deleteAccountOTPExpiry = null;
         user.deleteAccountAttempts = 0;
+        user.deleteAccountBlockedUntil = null;
         user.deleteAccountOtpResendAttempts = 0;
         user.deleteAccountOtpResendBlockedUntil = null;
         await user.save({ validateBeforeSave: false });
@@ -1052,7 +1214,7 @@ const updateUserProfile = asyncHandler(async (req, res) => {
     }
 
     // Step 3: Email validation and provider-specific rules
-    const currentUser = await User.findById(userId).select('email authProvider authProviders isVerified');
+    const currentUser = await User.findById(userId).select('email authProvider authProviders isVerified emailVerificationBlockedUntil');
     if (!currentUser) {
         throw new apiError(404, 'User not found');
     }
@@ -1090,6 +1252,18 @@ const updateUserProfile = asyncHandler(async (req, res) => {
         } else {
                 // Local users: initiate secure email-change flow (do NOT update `email` directly)
                 if (email !== currentUser.email) {
+                    if (isBlockActive(currentUser.emailVerificationBlockedUntil)) {
+                        const minutesRemaining = getBlockedMinutesRemaining(currentUser.emailVerificationBlockedUntil);
+                        return res.status(200).json(
+                            new apiResponse(
+                                200,
+                                null,
+                                `Too many invalid OTP attempts. Please try again after ${minutesRemaining} minute${minutesRemaining > 1 ? 's' : ''}.`,
+                                'rate_limited'
+                            )
+                        );
+                    }
+
                     emailIsChanging = true;
                     // Generate OTP and store hashed value in pending fields
                     const emailChangeOTP = generateOTP();
@@ -1100,6 +1274,7 @@ const updateUserProfile = asyncHandler(async (req, res) => {
                     updates.emailOtp = hashedEmailChangeOTP;
                     updates.emailOtpExpiry = otpExpiry;
                     updates.emailOtpResendAvailableAt = getNextEmailChangeResendAvailableAt();
+                    updates.emailVerificationBlockedUntil = null;
                     // reuse the emailVerificationAttempts counter for rate-limiting attempts
                     updates.emailVerificationAttempts = 0;
 
@@ -1173,6 +1348,7 @@ const updateUserProfile = asyncHandler(async (req, res) => {
                     emailOtpExpiry: null,
                     emailOtpResendAvailableAt: null,
                     emailVerificationAttempts: 0,
+                    emailVerificationBlockedUntil: null,
                 }
             }, { validateBeforeSave: false });
             logger.error('Failed to send verification email after email change:', err.message);
@@ -1182,11 +1358,11 @@ const updateUserProfile = asyncHandler(async (req, res) => {
 
     // Step 6: Response for non-email-update flows
     return res.status(200).json(
-        new apiResponse(
-            200,
-            updatedUser,
-            "Profile updated successfully"
-        )
+            new apiResponse(
+                200,
+                updatedUser,
+                OTP_RESPONSE_MESSAGES.genericPending
+            )
     );
 });
 
@@ -1372,7 +1548,7 @@ const forgotPassword = asyncHandler(async (req, res) => {
         new apiResponse(
             200,
             { otpSent },
-            'If the email exists, OTP has been sent'
+            OTP_RESPONSE_MESSAGES.genericPending
         )
     );
 
@@ -1406,6 +1582,10 @@ const forgotPassword = asyncHandler(async (req, res) => {
         return genericResponse(false);
     }
 
+    if (isBlockActive(user.resetPasswordBlockedUntil)) {
+        return genericResponse(false);
+    }
+
     // Only for users with a password: generate and save OTP, then send email
     const otp = generateOTP();
     const hashedOTP = hashOTP(otp);
@@ -1417,6 +1597,7 @@ const forgotPassword = asyncHandler(async (req, res) => {
     user.resetPasswordOTP = hashedOTP;
     user.resetPasswordOTPExpiry = otpExpiry;
     user.resetPasswordAttempts = 0;
+    user.resetPasswordBlockedUntil = null;
     user.resetPasswordOtpResendAttempts = 0;
     user.resetPasswordOtpResendBlockedUntil = null;
 
@@ -1499,11 +1680,22 @@ const resetPassword = asyncHandler(async (req, res) => {
         });
     }
 
+    if (isBlockActive(user.resetPasswordBlockedUntil)) {
+        const minutesRemaining = getBlockedMinutesRemaining(user.resetPasswordBlockedUntil);
+        return res.status(200).json({
+            success: false,
+            status: 'rate_limited',
+            message: `Too many invalid OTP attempts. Please try again after ${minutesRemaining} minute${minutesRemaining > 1 ? 's' : ''}.`,
+            data: { attemptsRemaining: 0 },
+        });
+    }
+
     // Check OTP expiry
     if (new Date() > user.resetPasswordOTPExpiry) {
         user.resetPasswordOTP = null;
         user.resetPasswordOTPExpiry = null;
         user.resetPasswordAttempts = 0;
+        user.resetPasswordBlockedUntil = null;
         await user.save({ validateBeforeSave: false });
 
         return res.status(200).json({
@@ -1516,10 +1708,12 @@ const resetPassword = asyncHandler(async (req, res) => {
 
     // Check max attempts
     if ((user.resetPasswordAttempts || 0) >= MAX_RESET_PASSWORD_OTP_ATTEMPTS) {
+        user.resetPasswordBlockedUntil = getValidationBlockedUntil();
+        await user.save({ validateBeforeSave: false });
         return res.status(200).json({
             success: false,
             status: 'rate_limited',
-            message: 'Maximum password reset attempts exceeded. Please request a new OTP.',
+            message: `Maximum password reset attempts exceeded. Please try again after ${OTP_VALIDATION_BLOCK_MINUTES} minutes.`,
             data: {
                 attemptsRemaining: 0,
             },
@@ -1531,15 +1725,26 @@ const resetPassword = asyncHandler(async (req, res) => {
 
     if (!isOTPValid) {
         user.resetPasswordAttempts = (user.resetPasswordAttempts || 0) + 1;
-        await user.save({ validateBeforeSave: false });
 
         const remainingAttempts = Math.max(0, MAX_RESET_PASSWORD_OTP_ATTEMPTS - user.resetPasswordAttempts);
+        if (remainingAttempts <= 0) {
+            user.resetPasswordBlockedUntil = getValidationBlockedUntil();
+            await user.save({ validateBeforeSave: false });
+            return res.status(200).json({
+                success: false,
+                status: 'rate_limited',
+                message: `Maximum password reset attempts exceeded. Please try again after ${OTP_VALIDATION_BLOCK_MINUTES} minutes.`,
+                data: {
+                    attemptsRemaining: 0,
+                },
+            });
+        }
+
+        await user.save({ validateBeforeSave: false });
         return res.status(200).json({
             success: false,
-            status: remainingAttempts === 0 ? 'rate_limited' : 'error',
-            message: remainingAttempts === 0
-                ? 'Maximum password reset attempts exceeded. Please request a new OTP.'
-                : `Invalid OTP. You have ${remainingAttempts} attempt${remainingAttempts > 1 ? 's' : ''} remaining.`,
+            status: 'error',
+            message: `Invalid OTP. You have ${remainingAttempts} attempt${remainingAttempts > 1 ? 's' : ''} remaining.`,
             data: {
                 attemptsRemaining: remainingAttempts,
             },
@@ -1551,6 +1756,7 @@ const resetPassword = asyncHandler(async (req, res) => {
     user.resetPasswordOTP = null;
     user.resetPasswordOTPExpiry = null;
     user.resetPasswordAttempts = 0;
+    user.resetPasswordBlockedUntil = null;
     user.resetPasswordOtpResendAttempts = 0;
     user.resetPasswordOtpResendBlockedUntil = null;
 
@@ -1610,6 +1816,18 @@ const resendOTP = asyncHandler(async (req, res) => {
                     null,
                     'If an account with this email exists, a new OTP has been sent',
                     'pending'
+                )
+            );
+        }
+
+        if (isBlockActive(pendingRegistration.emailVerificationBlockedUntil)) {
+            const minutesRemaining = getBlockedMinutesRemaining(pendingRegistration.emailVerificationBlockedUntil);
+            return res.status(200).json(
+                new apiResponse(
+                    200,
+                    null,
+                    `Too many invalid OTP attempts. Please try again after ${minutesRemaining} minute${minutesRemaining > 1 ? 's' : ''}.`,
+                    'rate_limited'
                 )
             );
         }
@@ -1674,6 +1892,12 @@ const resendOTP = asyncHandler(async (req, res) => {
 
         await pendingRegistration.save({ validateBeforeSave: false });
 
+        logOtpResendState('Signup OTP resend incremented', {
+            email: pendingRegistration.email,
+            resendAttempts: pendingRegistration.otpResendAttempts,
+            blockedUntil: pendingRegistration.otpResendBlockedUntil,
+        });
+
         const emailDispatch = await sendVerificationEmailWithBudget({
             email: pendingRegistration.email,
             otp,
@@ -1690,8 +1914,30 @@ const resendOTP = asyncHandler(async (req, res) => {
                         email: pendingRegistration.email,
                         otpResent: true,
                         emailSent: true,
+                        deliveryStatus: 'sent',
                     },
-                    'A new OTP has been sent to your email. Please check your inbox.'
+                    OTP_RESPONSE_MESSAGES.sent
+                )
+            );
+        }
+
+        if (emailDispatch.status === 'sandbox_fallback') {
+            logger.warn('⚠️ Signup resend generated an OTP but Resend sandbox blocked delivery', {
+                email: pendingRegistration.email,
+                resendAttempts: pendingRegistration.otpResendAttempts,
+            });
+
+            return res.status(200).json(
+                new apiResponse(
+                    200,
+                    {
+                        email: pendingRegistration.email,
+                        otpResent: true,
+                        emailSent: false,
+                        verificationPending: true,
+                        deliveryStatus: 'sandbox_blocked',
+                    },
+                    OTP_RESPONSE_MESSAGES.sandboxBlocked
                 )
             );
         }
@@ -1710,8 +1956,9 @@ const resendOTP = asyncHandler(async (req, res) => {
                         otpResent: true,
                         verificationPending: true,
                         emailSent: false,
+                        deliveryStatus: 'queued',
                     },
-                    'Your OTP request is being processed. If you do not receive it shortly, try resending again.'
+                    OTP_RESPONSE_MESSAGES.queued
                 )
             );
         }
@@ -1730,8 +1977,9 @@ const resendOTP = asyncHandler(async (req, res) => {
                         email: pendingRegistration.email,
                         verificationPending: true,
                         emailSent: false,
+                        deliveryStatus: 'failed',
                     },
-                    'The verification email could not be delivered. Please check your email or try again in a moment.'
+                    OTP_RESPONSE_MESSAGES.sandboxBlocked
                 )
             );
         }
@@ -1745,6 +1993,16 @@ const resendOTP = asyncHandler(async (req, res) => {
                     'If an account with this email exists, a new OTP has been sent'
                 )
             );
+        }
+
+        if (isBlockActive(user.resetPasswordBlockedUntil)) {
+            const minutesRemaining = getBlockedMinutesRemaining(user.resetPasswordBlockedUntil);
+            return res.status(200).json({
+                success: false,
+                status: 'rate_limited',
+                message: `Too many invalid OTP attempts. Please try again after ${minutesRemaining} minute${minutesRemaining > 1 ? 's' : ''}.`,
+                data: { attemptsRemaining: 0 },
+            });
         }
 
         if ((user.resetPasswordOtpResendAttempts || 0) >= MAX_RESET_PASSWORD_OTP_RESEND_ATTEMPTS) {
@@ -1783,8 +2041,29 @@ const resendOTP = asyncHandler(async (req, res) => {
 
         await user.save({ validateBeforeSave: false });
 
+        logOtpResendState('Password-reset OTP resend incremented', {
+            userId: String(user._id),
+            email: user.email,
+            resendAttempts: user.resetPasswordOtpResendAttempts,
+            blockedUntil: user.resetPasswordOtpResendBlockedUntil,
+        });
+
         try {
-            await sendEmailOTP(user.email, otp);
+            const emailResult = await sendEmailOTP(user.email, otp);
+
+            if (emailResult?.sandboxFallback) {
+                logger.warn('⚠️ Password-reset OTP generated but Resend sandbox blocked delivery', {
+                    email: user.email,
+                    resendAttempts: user.resetPasswordOtpResendAttempts,
+                });
+
+                return res.status(200).json({
+                    success: true,
+                    status: 'pending',
+                    message: OTP_RESPONSE_MESSAGES.sandboxBlocked,
+                    data: { otpSent: false, verificationPending: true },
+                });
+            }
         } catch (error) {
             user.resetPasswordOTP = null;
             user.resetPasswordOTPExpiry = null;
@@ -1984,12 +2263,27 @@ const verifyEmailOTP = asyncHandler(async (req, res) => {
         });
     }
 
-    // Check max attempts
-    if ((pendingRegistration.emailVerificationAttempts || 0) >= MAX_SIGNUP_OTP_ATTEMPTS) {
+    if (isBlockActive(pendingRegistration.emailVerificationBlockedUntil)) {
+        const minutesRemaining = getBlockedMinutesRemaining(pendingRegistration.emailVerificationBlockedUntil);
         return res.status(200).json({
             success: false,
             status: 'rate_limited',
-            message: 'Maximum verification attempts exceeded. Please request a new OTP.',
+            message: `Too many invalid OTP attempts. Please try again after ${minutesRemaining} minute${minutesRemaining > 1 ? 's' : ''}.`,
+            data: {
+                attemptsRemaining: 0,
+            },
+        });
+    }
+
+    // Check max attempts
+    if ((pendingRegistration.emailVerificationAttempts || 0) >= MAX_SIGNUP_OTP_ATTEMPTS) {
+        pendingRegistration.emailVerificationBlockedUntil = getValidationBlockedUntil();
+        await pendingRegistration.save({ validateBeforeSave: false });
+
+        return res.status(200).json({
+            success: false,
+            status: 'rate_limited',
+            message: `Too many invalid OTP attempts. Please try again after ${OTP_VALIDATION_BLOCK_MINUTES} minutes.`,
             data: {
                 attemptsRemaining: 0,
             },
@@ -2001,20 +2295,35 @@ const verifyEmailOTP = asyncHandler(async (req, res) => {
 
     if (!isOTPValid) {
         pendingRegistration.emailVerificationAttempts += 1;
-        await pendingRegistration.save({ validateBeforeSave: false });
 
         const remainingAttempts = Math.max(0, MAX_SIGNUP_OTP_ATTEMPTS - pendingRegistration.emailVerificationAttempts);
+        if (remainingAttempts <= 0) {
+            pendingRegistration.emailVerificationBlockedUntil = getValidationBlockedUntil();
+            await pendingRegistration.save({ validateBeforeSave: false });
+
+            return res.status(200).json({
+                success: false,
+                status: 'rate_limited',
+                message: `Maximum verification attempts exceeded. Please try again after ${OTP_VALIDATION_BLOCK_MINUTES} minutes.`,
+                data: {
+                    attemptsRemaining: 0,
+                },
+            });
+        }
+
+        await pendingRegistration.save({ validateBeforeSave: false });
         return res.status(200).json({
             success: false,
-            status: remainingAttempts === 0 ? 'rate_limited' : 'error',
-            message: remainingAttempts === 0
-                ? 'Maximum verification attempts exceeded. Please request a new OTP.'
-                : `Invalid OTP. ${remainingAttempts} attempt${remainingAttempts > 1 ? 's' : ''} remaining.`,
+            status: 'error',
+            message: `Invalid OTP. ${remainingAttempts} attempt${remainingAttempts > 1 ? 's' : ''} remaining.`,
             data: {
                 attemptsRemaining: remainingAttempts,
             },
         });
     }
+
+    pendingRegistration.emailVerificationAttempts = 0;
+    pendingRegistration.emailVerificationBlockedUntil = null;
 
     const existingUser = await User.findOne({
         $or: [
@@ -2126,6 +2435,16 @@ const verifyEmailChange = asyncHandler(async (req, res) => {
         });
     }
 
+    if (isBlockActive(user.emailVerificationBlockedUntil)) {
+        const minutesRemaining = getBlockedMinutesRemaining(user.emailVerificationBlockedUntil);
+        return res.status(200).json({
+            success: false,
+            status: 'rate_limited',
+            message: `Too many invalid OTP attempts. Please try again after ${minutesRemaining} minute${minutesRemaining > 1 ? 's' : ''}.`,
+            data: { attemptsRemaining: 0 },
+        });
+    }
+
     // Check OTP expiry
     if (new Date() > user.emailOtpExpiry) {
         user.pendingEmail = null;
@@ -2133,6 +2452,7 @@ const verifyEmailChange = asyncHandler(async (req, res) => {
         user.emailOtpExpiry = null;
         user.emailOtpResendAvailableAt = null;
         user.emailVerificationAttempts = 0;
+        user.emailVerificationBlockedUntil = null;
         await user.save({ validateBeforeSave: false });
 
         return res.status(200).json({
@@ -2145,17 +2465,13 @@ const verifyEmailChange = asyncHandler(async (req, res) => {
 
     // Check max attempts
     if (user.emailVerificationAttempts >= MAX_EMAIL_CHANGE_OTP_ATTEMPTS) {
-        user.pendingEmail = null;
-        user.emailOtp = null;
-        user.emailOtpExpiry = null;
-        user.emailOtpResendAvailableAt = null;
-        user.emailVerificationAttempts = 0;
+        user.emailVerificationBlockedUntil = getValidationBlockedUntil();
         await user.save({ validateBeforeSave: false });
 
         return res.status(200).json({
             success: false,
             status: 'rate_limited',
-            message: 'Maximum verification attempts exceeded. Please request a new OTP.',
+            message: `Too many invalid OTP attempts. Please try again after ${OTP_VALIDATION_BLOCK_MINUTES} minutes.`,
             data: { attemptsRemaining: 0 },
         });
     }
@@ -2167,17 +2483,13 @@ const verifyEmailChange = asyncHandler(async (req, res) => {
         const remaining = MAX_EMAIL_CHANGE_OTP_ATTEMPTS - user.emailVerificationAttempts;
 
         if (remaining <= 0) {
-            user.pendingEmail = null;
-            user.emailOtp = null;
-            user.emailOtpExpiry = null;
-            user.emailOtpResendAvailableAt = null;
-            user.emailVerificationAttempts = 0;
+            user.emailVerificationBlockedUntil = getValidationBlockedUntil();
             await user.save({ validateBeforeSave: false });
 
             return res.status(200).json({
                 success: false,
                 status: 'rate_limited',
-                message: 'Maximum verification attempts exceeded. Please request a new OTP.',
+                message: `Maximum verification attempts exceeded. Please try again after ${OTP_VALIDATION_BLOCK_MINUTES} minutes.`,
                 data: { attemptsRemaining: 0 },
             });
         }
@@ -2237,6 +2549,7 @@ const verifyEmailChange = asyncHandler(async (req, res) => {
     user.emailOtpResendAttempts = 0;
     user.emailOtpResendBlockedUntil = null;
     user.emailVerificationAttempts = 0;
+    user.emailVerificationBlockedUntil = null;
     user.pendingFullName = null;
     user.pendingUsername = null;
     user.pendingBio = null;
@@ -2266,7 +2579,19 @@ const resendEmailChange = asyncHandler(async (req, res) => {
 
     if (!user.pendingEmail) {
         return res.status(200).json(
-            new apiResponse(200, null, 'If a pending email change exists, a new OTP has been sent', 'pending')
+            new apiResponse(200, null, OTP_RESPONSE_MESSAGES.genericPending, 'pending')
+        );
+    }
+
+    if (isBlockActive(user.emailVerificationBlockedUntil)) {
+        const minutesRemaining = getBlockedMinutesRemaining(user.emailVerificationBlockedUntil);
+        return res.status(200).json(
+            new apiResponse(
+                200,
+                null,
+                `Too many invalid OTP attempts. Please try again after ${minutesRemaining} minute${minutesRemaining > 1 ? 's' : ''}.`,
+                'rate_limited'
+            )
         );
     }
 
@@ -2313,8 +2638,34 @@ const resendEmailChange = asyncHandler(async (req, res) => {
 
     await user.save({ validateBeforeSave: false });
 
+    logOtpResendState('Email-change OTP resend incremented', {
+        userId: String(userId),
+        email: user.pendingEmail,
+        resendAttempts: user.emailOtpResendAttempts,
+        blockedUntil: user.emailOtpResendBlockedUntil,
+    });
+
     try {
-        await sendEmailVerification(user.pendingEmail, otp);
+        const result = await sendEmailVerification(user.pendingEmail, otp);
+
+        if (result?.sandboxFallback) {
+            logger.warn('⚠️ Email-change OTP generated but Resend sandbox blocked delivery', {
+                email: user.pendingEmail,
+                resendAttempts: user.emailOtpResendAttempts,
+            });
+
+            return res.status(200).json(
+                new apiResponse(
+                    200,
+                    {
+                        email: user.pendingEmail,
+                        verificationPending: true,
+                        emailSent: false,
+                    },
+                    OTP_RESPONSE_MESSAGES.sandboxBlocked
+                )
+            );
+        }
     } catch (err) {
         logger.error('Failed to resend email-change verification email:', {
             message: err?.message,
@@ -2329,13 +2680,13 @@ const resendEmailChange = asyncHandler(async (req, res) => {
                     verificationPending: true,
                     emailSent: false,
                 },
-                'The verification email could not be delivered. Please try "Resend OTP" again in a moment.'
+                OTP_RESPONSE_MESSAGES.sandboxBlocked
             )
         );
     }
 
     return res.status(200).json(
-        new apiResponse(200, null, 'If a pending email change exists, a new OTP has been sent', 'pending')
+        new apiResponse(200, null, OTP_RESPONSE_MESSAGES.genericPending, 'pending')
     );
 });
 

@@ -35,6 +35,10 @@ const pendingRegistrationSchema = new Schema(
             type: Number,
             default: 0,
         },
+        emailVerificationBlockedUntil: {
+            type: Date,
+            default: null,
+        },
         otpResendAttempts: {
             type: Number,
             default: 0,
