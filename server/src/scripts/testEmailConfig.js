@@ -8,8 +8,8 @@
  * 
  * This will:
  * 1. Check if email configuration exists
- * 2. Create SMTP transporter
- * 3. Verify SMTP connection and authentication
+ * 2. Initialize the Resend client
+ * 3. Validate the configured sender details
  * 4. Send a test email to your configured email address
  */
 

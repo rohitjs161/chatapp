@@ -462,7 +462,7 @@ const registerUser = asyncHandler(async (req, res) => {
             }
 
             if (emailDispatch.status === 'queued') {
-                logger.warn('⏳ Verification email dispatch queued for existing pending registration due to SMTP latency', {
+                logger.warn('⏳ Verification email dispatch queued for existing pending registration due to email delivery latency', {
                     email: emailNormalized,
                     responseTimeoutMs: EMAIL_DELIVERY_RESPONSE_TIMEOUT_MS,
                 });
@@ -542,7 +542,7 @@ const registerUser = asyncHandler(async (req, res) => {
         }
 
         if (emailDispatch.status === 'queued') {
-            logger.warn('⏳ Verification email dispatch queued for new pending registration due to SMTP latency', {
+                logger.warn('⏳ Verification email dispatch queued for new pending registration due to email delivery latency', {
                 email: emailNormalized,
                 responseTimeoutMs: EMAIL_DELIVERY_RESPONSE_TIMEOUT_MS,
             });
@@ -1697,7 +1697,7 @@ const resendOTP = asyncHandler(async (req, res) => {
         }
 
         if (emailDispatch.status === 'queued') {
-            logger.warn('⏳ Resend OTP dispatch queued due to SMTP latency', {
+            logger.warn('⏳ Resend OTP dispatch queued due to email delivery latency', {
                 email: pendingRegistration.email,
                 responseTimeoutMs: EMAIL_DELIVERY_RESPONSE_TIMEOUT_MS,
             });

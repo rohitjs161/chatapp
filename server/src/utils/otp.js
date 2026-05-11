@@ -1,42 +1,17 @@
 import crypto from 'crypto';
-import nodemailer from 'nodemailer';
-import dns from 'dns';
-import net from 'net';
-import tls from 'tls';
+import { Resend } from 'resend';
 import { apiError } from './apiError.js';
-import { logger } from "./logger.js";
+import { logger } from './logger.js';
 
-// ============================================
-// INITIALIZE DNS CONFIG FOR IPv4-FIRST RESOLUTION
-// ============================================
-// Prefer IPv4 when resolving hostnames to avoid Render IPv6 routing issues.
-// Some Node versions allow configuring the default DNS result order so lookups
-// return IPv4 addresses first. This reduces chances of ENETUNREACH/ESOCKET
-// failures when the platform's IPv6 connectivity is unreliable.
-try {
-    if (typeof dns.setDefaultResultOrder === 'function') {
-        dns.setDefaultResultOrder('ipv4first');
-        logger.log('📧 DNS default result order set to ipv4first');
-    }
-} catch (e) {
-    // Non-fatal: if the runtime doesn't support this API, continue and rely on
-    // the explicit lookup/family settings already applied to the transporter.
-    logger.warn('📧 dns.setDefaultResultOrder not available:', e?.message || e);
-}
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const DEFAULT_FROM_NAME = 'ChatApp Support';
+const DEFAULT_VERIFY_SUBJECT = 'Verify Your Email - ChatApp';
+const DEFAULT_FORGOT_PASSWORD_SUBJECT = 'Reset Your Password - ChatApp';
+const MAX_EMAIL_SEND_RETRIES = 3;
+const RETRY_DELAYS_MS = [1000, 2000, 4000];
 
-// ============================================
-// GLOBAL TRANSPORTER SINGLETON (Production Safe)
-// ============================================
-// Maintains ONE reusable transporter instance instead of creating new ones
-// on every email send. This prevents socket exhaustion and connection pooling issues
-// that cause ETIMEDOUT and ESOCKET errors in production environments like Render.
-let globalEmailTransporter = null;
-let transitionInProgress = false;
-const transporterLock = Symbol('transporter_lock');
+let resendClient = null;
 
-// ============================================
-// UTILITY FUNCTIONS
-// ============================================
 const getTrimmedEnv = (name) => {
     const value = process.env[name];
 
@@ -47,580 +22,196 @@ const getTrimmedEnv = (name) => {
     return value.trim();
 };
 
-const getSmtpUsername = (smtpUrl) => {
-    if (!smtpUrl) {
-        return '';
-    }
+const isValidEmailAddress = (value = '') => EMAIL_REGEX.test(String(value || '').trim());
 
-    try {
-        const parsedUrl = new URL(smtpUrl);
-        return decodeURIComponent(parsedUrl.username || '').trim();
-    } catch {
-        return '';
-    }
-};
-
-const getDefaultSenderEmail = () => {
-    return getTrimmedEnv('SENDGRID_FROM_EMAIL')
-        || getTrimmedEnv('EMAIL_FROM')
-        || getSmtpUsername(getTrimmedEnv('SMTP_URL'))
-        || getTrimmedEnv('EMAIL_USER');
-};
-
-const parsePositiveInt = (value, fallbackValue) => {
-    const parsed = Number.parseInt(String(value || '').trim(), 10);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackValue;
-};
-
-const isTransientEmailError = (error = {}) => {
-    const code = String(error?.code || '').toUpperCase();
-    const message = String(error?.message || '').toLowerCase();
-    return [
-        'ENETUNREACH',
-        'ESOCKET',
-        'ETIMEDOUT',
-        'ESOCKETTIMEDOUT',
-        'ECONNREFUSED',
-        'EHOSTUNREACH',
-        'EAI_AGAIN',
-        'ECONNRESET',
-    ].includes(code) || message.includes('connection pool was closed') || message.includes('pool was closed');
-};
+const normalizeEmailAddress = (value = '') => String(value || '').trim();
 
 const toEmailErrorMeta = (error = {}) => ({
-    code: error?.code,
+    name: error?.name,
     message: error?.message,
-    responseCode: error?.responseCode,
-    command: error?.command,
-    errno: error?.errno,
-    syscall: error?.syscall,
+    statusCode: error?.statusCode ?? error?.status ?? error?.response?.status,
+    code: error?.code,
 });
 
-const extractEmailAddress = (input = '') => {
-    if (typeof input !== 'string') return '';
-    const match = input.match(/<([^>]+)>/);
-    if (match?.[1]) return String(match[1]).trim();
-    return input.trim();
-};
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// ============================================
-// PRODUCTION-SAFE GMAIL TRANSPORTER CREATION
-// ============================================
-// Single, reusable transporter instance for Gmail SMTP.
-// Configured for Render production with:
-// - IPv4-only DNS resolution (family: 4)
-// - Connection pooling (pool: true, maxConnections: 5)
-// - Extended timeouts (connectionTimeout: 45s, socketTimeout: 120s)
-// - TLS v1.2+ with lenient cert verification
-// - No transporter.verify() in production
-
-// createGmailTransporter:
-// - Uses dns.resolve4 to get an IPv4 address for smtp.gmail.com
-// - Creates a TCP socket bound to that IPv4 address via net.createConnection
-// - Wraps the socket in TLS using tls.connect to ensure the socket uses the
-//   resolved IPv4 address (this guarantees Node will not attempt IPv6)
-// - Supplies that socket to Nodemailer via `getSocket` so Nodemailer never
-//   performs hostname-to-IP resolution on its own.
-// This enforces IPv4 HARD as requested for Render, and matches the exact
-// transporter configuration required for production stability.
-const createGmailTransporter = () => {
-    const emailUser = getTrimmedEnv('EMAIL_USER');
-    const emailPassword = getTrimmedEnv('EMAIL_PASSWORD').replace(/\s+/g, '');
-
-    if (!emailUser || !emailPassword) {
-        const missingFields = [];
-        if (!emailUser) missingFields.push('EMAIL_USER');
-        if (!emailPassword) missingFields.push('EMAIL_PASSWORD');
-        throw new Error(`Missing Gmail config: ${missingFields.join(', ')}`);
+export const getResendClient = () => {
+    if (resendClient) {
+        return resendClient;
     }
 
-    logger.log(`📧 Creating Gmail transporter - User: ${emailUser}`);
+    const apiKey = getTrimmedEnv('RESEND_API_KEY');
 
-    // Helper that returns a Promise resolving to a pre-connected socket using
-    // IPv4-only resolution and TLS wrapping. Nodemailer will use this socket
-    // for the SMTP session; because we provide a ready socket connected to an
-    // IPv4 address, Nodemailer cannot initiate an IPv6 connection.
-    const getSocket = (host, port, options, callback) => {
-        // Normalize arguments: Nodemailer may call getSocket with different
-        // signatures. Ensure `port` is a number and `callback` is a function.
-        if (typeof port === 'function') {
-            callback = port;
-            port = undefined;
-            options = options || {};
-        } else if (typeof options === 'function') {
-            callback = options;
-            options = {};
-        }
+    if (!apiKey || !apiKey.startsWith('re_')) {
+        logger.error('❌ RESEND_API_KEY is missing or invalid');
+        throw new apiError(500, 'Failed to send email. Please try again later.');
+    }
 
-        // Ensure port is a number or fallback to 587
-        const portNum = Number(port || (options && options.port) || 587);
-        
-        // defensive: if callback is not a function, throw
-        if (typeof callback !== 'function') {
-            throw new TypeError('getSocket callback must be a function');
-        }
-        const dnsTimeoutMs = parsePositiveInt(process.env.EMAIL_DNS_TIMEOUT || process.env.DNS_TIMEOUT || 30000, 30000);
+    resendClient = new Resend(apiKey);
+    logger.log('📧 Resend initialized');
 
-        // Resolve IPv4 addresses explicitly
-        const timer = setTimeout(() => {
-            const err = new Error('DNS resolve4 timeout');
-            err.code = 'EAI_TIMEDOUT';
-            callback(err);
-        }, dnsTimeoutMs);
+    return resendClient;
+};
 
-        dns.resolve4('smtp.gmail.com', (dnsErr, addresses) => {
-            clearTimeout(timer);
-            if (dnsErr) {
-                logger.error('❌ dns.resolve4 failed for smtp.gmail.com', toEmailErrorMeta(dnsErr));
-                callback(dnsErr);
-                return;
-            }
+const getSenderConfig = () => {
+    const fromEmail = getTrimmedEnv('EMAIL_FROM');
+    const fromName = getTrimmedEnv('EMAIL_FROM_NAME') || DEFAULT_FROM_NAME;
+    const replyTo = getTrimmedEnv('EMAIL_REPLY_TO');
 
-            if (!Array.isArray(addresses) || addresses.length === 0) {
-                const err = new Error('No IPv4 addresses returned from dns.resolve4');
-                err.code = 'ENODATA';
-                logger.error('❌ dns.resolve4 returned no addresses', { addresses });
-                callback(err);
-                return;
-            }
+    if (!fromEmail) {
+        logger.error('❌ EMAIL_FROM is not configured');
+        throw new apiError(500, 'Failed to send email. Please try again later.');
+    }
 
-            // Use the first IPv4 address returned. This prevents any hostname
-            // auto-resolution by Nodemailer and guarantees we connect to IPv4.
-            const ipv4 = addresses[0];
-            logger.log(`📧 dns.resolve4 -> smtp.gmail.com -> ${ipv4}`);
+    if (!isValidEmailAddress(fromEmail)) {
+        logger.error('❌ EMAIL_FROM is invalid', { email: fromEmail });
+        throw new apiError(500, 'Failed to send email. Please try again later.');
+    }
 
-            // Create a TCP connection to the IPv4 address
-            const socketOptions = {
-                host: ipv4,
-                port: portNum,
-                family: 4,
-                timeout: parsePositiveInt(process.env.EMAIL_SOCKET_TIMEOUT || 60000, 60000),
-            };
+    if (replyTo && !isValidEmailAddress(replyTo)) {
+        logger.error('❌ EMAIL_REPLY_TO is invalid', { email: replyTo });
+        throw new apiError(500, 'Failed to send email. Please try again later.');
+    }
 
-            const tcpSocket = net.createConnection(socketOptions);
-
-            // Ensure socket errors/timeouts are handled and bubbled to the caller
-            const onError = (err) => {
-                cleanup();
-                logger.error('❌ TCP socket error connecting to SMTP IPv4 address', toEmailErrorMeta(err));
-                callback(err);
-            };
-
-            const onTimeout = () => {
-                const err = new Error('TCP socket connection timed out');
-                err.code = 'ETIMEDOUT';
-                cleanup();
-                callback(err);
-            };
-
-            const onConnect = () => {
-                // Once TCP connected, immediately wrap with TLS to match
-                // Gmail's expectation. We set servername to smtp.gmail.com to
-                // preserve SNI while still using the resolved IPv4 address.
-                try {
-                    const tlsSocket = tls.connect({
-                        socket: tcpSocket,
-                        servername: 'smtp.gmail.com',
-                        rejectUnauthorized: false,
-                        minVersion: 'TLSv1.2',
-                    });
-
-                    // Propagate errors from TLS socket
-                    tlsSocket.on('error', (err) => {
-                        cleanup();
-                        logger.error('❌ TLS socket error for SMTP connection', toEmailErrorMeta(err));
-                        callback(err);
-                    });
-
-                    // When secure connection is established, return to Nodemailer
-                    tlsSocket.once('secureConnect', () => {
-                        cleanupListeners();
-                        // Ensure keepAlive on underlying socket
-                        try { tlsSocket.setKeepAlive(true, 60000); } catch (e) {}
-                        callback(null, tlsSocket);
-                    });
-
-                } catch (err) {
-                    cleanup();
-                    callback(err);
-                }
-            };
-
-            const cleanupListeners = () => {
-                tcpSocket.removeListener('error', onError);
-                tcpSocket.removeListener('timeout', onTimeout);
-                tcpSocket.removeListener('connect', onConnect);
-            };
-
-            const cleanup = () => {
-                try { cleanupListeners(); } catch (e) {}
-                try { tcpSocket.destroy(); } catch (e) {}
-            };
-
-            tcpSocket.once('error', onError);
-            tcpSocket.once('timeout', onTimeout);
-            tcpSocket.once('connect', onConnect);
-        });
+    return {
+        fromEmail,
+        fromName,
+        replyTo: replyTo || fromEmail,
     };
-
-    // Create transporter with exact production-safe options requested.
-    const transporter = nodemailer.createTransport({
-        host: 'smtp.gmail.com',
-        port: 587,
-        secure: false,
-        requireTLS: true,
-        authMethod: 'LOGIN',
-
-        // Pooling and rate limits
-        pool: true,
-        maxConnections: 1,
-        maxMessages: Infinity,
-        rateDelta: 20000,
-        rateLimit: 5,
-
-        // Exact timeouts requested
-        connectionTimeout: 60000,
-        greetingTimeout: 60000,
-        socketTimeout: 60000,
-        dnsTimeout: 30000,
-
-        // Force IPv4 family for safety; getSocket ensures IPv4 connect
-        family: 4,
-
-        // TLS defaults; servername is set when wrapping the socket above
-        tls: {
-            rejectUnauthorized: false,
-            minVersion: 'TLSv1.2',
-            servername: 'smtp.gmail.com',
-        },
-
-        // Authentication
-        auth: {
-            user: emailUser,
-            pass: emailPassword,
-        },
-
-        // Do not let Nodemailer perform its own DNS->IP resolution; supply socket
-        getSocket,
-
-        logger: false,
-        debug: false,
-    });
-
-    // Attach listeners to allow automatic recreation on serious transport errors
-    try {
-        if (transporter && typeof transporter.on === 'function') {
-            transporter.on('error', (err) => {
-                logger.error('⚠️ Transporter error event, clearing singleton cache', toEmailErrorMeta(err));
-                globalEmailTransporter = null;
-            });
-
-            transporter.on('close', () => {
-                logger.warn('⚠️ Transporter closed; clearing singleton cache for reconnect');
-                globalEmailTransporter = null;
-            });
-        }
-    } catch (e) {
-        logger.warn('Could not attach transporter listeners:', e?.message || e);
-    }
-
-    return transporter;
 };
 
-// ============================================
-// SINGLETON TRANSPORTER GETTER (Cache)
-// ============================================
-// Returns cached transporter instance. Creates on first call.
-// Prevents socket exhaustion and connection pooling issues.
-export const getTransporter = () => {
-    if (!globalEmailTransporter) {
-        try {
-            globalEmailTransporter = createGmailTransporter();
-            logger.log('✅ Global Gmail transporter initialized (singleton)');
-        } catch (error) {
-            logger.error('❌ Failed to create Gmail transporter:', error.message);
-            throw error;
-        }
+export const buildMailOptions = ({ email, subject, htmlContent }) => {
+    const recipientEmail = normalizeEmailAddress(email);
+
+    if (!recipientEmail || !isValidEmailAddress(recipientEmail)) {
+        logger.error('❌ Invalid recipient email', { email: recipientEmail });
+        throw new apiError(500, 'Failed to send email. Please try again later.');
     }
-    return globalEmailTransporter;
+
+    const { fromEmail, fromName, replyTo } = getSenderConfig();
+
+    return {
+        from: `${fromName} <${fromEmail}>`,
+        to: [recipientEmail],
+        subject,
+        html: htmlContent,
+        replyTo,
+    };
 };
 
-// ============================================
-// TRANSPORTER HEALTH & RESET HELPERS
-// ============================================
-// Safely closes and clears the global transporter so the next send will
-// recreate it. This avoids reconnect spam and ensures a fresh IPv4 socket
-// is created on the next send attempt.
-const safeResetTransporter = async () => {
-    try {
-        if (globalEmailTransporter && typeof globalEmailTransporter.close === 'function') {
-            try { globalEmailTransporter.close(); } catch (_) {}
-        }
-    } catch (e) {
-        // suppress
-    } finally {
-        globalEmailTransporter = null;
-    }
+const getResendStatusCode = (error = {}) => {
+    const statusCode = Number(error?.statusCode ?? error?.status ?? error?.response?.status);
+    return Number.isFinite(statusCode) ? statusCode : 0;
 };
 
-// verifyTransporterHealth:
-// - In development: uses transporter.verify() to validate configuration
-// - In production: performs a lightweight IPv4 TCP connect to smtp.gmail.com
-//   using dns.resolve4 to avoid calling transporter.verify() (as requested)
-export const verifyTransporterHealth = async () => {
-    if (process.env.NODE_ENV !== 'production') {
-        try {
-            const t = getTransporter();
-            await t.verify();
-            return true;
-        } catch (e) {
-            logger.error('Transporter verify failed (dev):', toEmailErrorMeta(e));
-            return false;
-        }
-    }
+const isTransientResendError = (error = {}) => {
+    const statusCode = getResendStatusCode(error);
+    const code = String(error?.code || error?.name || '').toUpperCase();
+    const message = String(error?.message || '').toLowerCase();
+    const causeMessage = String(error?.cause?.message || '').toLowerCase();
 
-    // Production: perform a small IPv4 TCP connect to check reachability
-    try {
-        const addresses = await new Promise((resolve, reject) => {
-            dns.resolve4('smtp.gmail.com', (err, addrs) => err ? reject(err) : resolve(addrs));
-        });
-
-        if (!addresses || addresses.length === 0) return false;
-        const ip = addresses[0];
-
-        await new Promise((resolve, reject) => {
-            const sock = net.createConnection({ host: ip, port: 587, family: 4, timeout: 10000 }, () => {
-                try { sock.end(); } catch (e) {}
-                resolve(true);
-            });
-
-            sock.once('error', (err) => { try { sock.destroy(); } catch (e) {} ; reject(err); });
-            sock.once('timeout', () => { try { sock.destroy(); } catch (e) {} ; const tErr = new Error('connect timeout'); tErr.code = 'ETIMEDOUT'; reject(tErr); });
-        });
-
-        return true;
-    } catch (e) {
-        logger.error('Transporter health check failed (prod):', toEmailErrorMeta(e));
+    if ([400, 401, 403, 404, 422].includes(statusCode)) {
         return false;
     }
+
+    if (message.includes('invalid api key')
+        || message.includes('unauthorized')
+        || message.includes('forbidden')
+        || message.includes('authentication')
+        || message.includes('invalid domain')
+        || message.includes('invalid from')
+        || message.includes('invalid email')
+        || message.includes('email address is invalid')
+        || causeMessage.includes('invalid api key')) {
+        return false;
+    }
+
+    if (statusCode === 429 || statusCode >= 500) {
+        return true;
+    }
+
+    return [
+        'ECONNRESET',
+        'ECONNREFUSED',
+        'ETIMEDOUT',
+        'ESOCKETTIMEDOUT',
+        'EAI_AGAIN',
+        'ENETUNREACH',
+        'EHOSTUNREACH',
+        'ECONNABORTED',
+        'FETCH_ERROR',
+        'UND_ERR_CONNECT_TIMEOUT',
+    ].includes(code)
+        || message.includes('fetch failed')
+        || message.includes('network error')
+        || message.includes('socket')
+        || message.includes('timeout')
+        || message.includes('connection reset')
+        || causeMessage.includes('timeout')
+        || causeMessage.includes('socket');
 };
 
-// ============================================
-// GENERATE OTP
-// ============================================
-export const generateOTP = () => {
-    return Math.floor(100000 + Math.random() * 900000).toString();
-};
-
-// ============================================
-// HASH OTP
-// ============================================
-export const hashOTP = (otp) => {
-    return crypto.createHash('sha256').update(otp).digest('hex');
-};
-
-// ============================================
-// COMPARE OTP
-// ============================================
-export const compareOTP = (inputOTP, storedHashedOTP) => {
-    const hashedInputOTP = hashOTP(inputOTP);
-    return hashedInputOTP === storedHashedOTP;
-};
-
-// ============================================
-// SEND EMAIL WITH EXPONENTIAL BACKOFF RETRY
-// ============================================
-// Retries email delivery for transient network errors with exponential backoff.
-// Does NOT retry on authentication/configuration errors.
-// Returns immediately after first success.
-const sendEmailWithRetry = async (mailOptions, maxRetries = 3) => {
+export const sendEmailWithRetry = async (mailOptions, maxRetries = MAX_EMAIL_SEND_RETRIES) => {
     let lastError;
 
     for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
-        const transporter = getTransporter();
+        const client = getResendClient();
+
         try {
-            logger.log(`📧 Attempt ${attempt}/${maxRetries} to send email to: ${mailOptions.to}`);
-            const result = await transporter.sendMail(mailOptions);
-            logger.log(`✅ Email sent successfully to ${mailOptions.to} | Message ID: ${result.messageId}`);
+            logger.log(`📧 Attempt ${attempt}/${maxRetries} to send email to: ${mailOptions.to?.[0] || mailOptions.to}`);
+
+            const result = await client.emails.send(mailOptions);
+
+            if (result?.error) {
+                const resendError = result.error instanceof Error
+                    ? result.error
+                    : Object.assign(new Error(result.error?.message || 'Resend request failed'), result.error);
+
+                if (result.error?.statusCode && !resendError.statusCode) {
+                    resendError.statusCode = result.error.statusCode;
+                }
+
+                throw resendError;
+            }
+
+            logger.log(`✅ Resend email sent successfully to ${mailOptions.to?.[0] || mailOptions.to} | Message ID: ${result?.data?.id || 'unknown'}`);
             return result;
         } catch (error) {
             lastError = error;
-            const isNetworkError = isTransientEmailError(error);
+            const statusCode = getResendStatusCode(error);
+            const transient = isTransientResendError(error);
             const hasRetriesLeft = attempt < maxRetries;
 
-            // If this looks like a connection-level timeout/error, reset the
-            // cached transporter so the next attempt creates a fresh IPv4 socket.
-            if (isNetworkError) {
-                try { await safeResetTransporter(); } catch (e) { /* ignore */ }
-            }
-
-            if (isNetworkError && hasRetriesLeft) {
-                // Exponential backoff: 1s, 2s, 4s
-                const delayMs = Math.min(1000 * Math.pow(2, attempt - 1), 4000);
-                logger.warn(`⚠️ Transient network error on attempt ${attempt}, retrying in ${delayMs}ms...`, {
+            if (transient && hasRetriesLeft) {
+                const delayMs = RETRY_DELAYS_MS[attempt - 1] || RETRY_DELAYS_MS[RETRY_DELAYS_MS.length - 1];
+                logger.warn(`⚠️ Retrying email delivery in ${delayMs}ms`, {
                     ...toEmailErrorMeta(error),
+                    email: mailOptions.to?.[0] || mailOptions.to,
                 });
-                await new Promise(resolve => setTimeout(resolve, delayMs));
+                await sleep(delayMs);
                 continue;
             }
 
-            if (!isNetworkError) {
-                // Non-transient error: don't retry, throw immediately
-                logger.error(`❌ Non-transient SMTP error (attempt ${attempt}):`, {
-                    ...toEmailErrorMeta(error),
-                });
+            logger.error('❌ Failed to send email', {
+                email: mailOptions.to?.[0] || mailOptions.to,
+                statusCode,
+                ...toEmailErrorMeta(error),
+            });
+
+            if (!transient) {
                 throw error;
             }
 
-            // All retries exhausted
-            logger.error(`❌ Email delivery failed after ${maxRetries} attempts:`, {
-                ...toEmailErrorMeta(error),
-            });
+            break;
         }
     }
 
-    // All retries exhausted for transient error
     throw lastError;
 };
 
-const isConnectionTimeoutError = (error = {}) => {
-    const code = String(error?.code || '').toUpperCase();
-    const command = String(error?.command || '').toUpperCase();
-
-    return code === 'ETIMEDOUT'
-        || code === 'ESOCKETTIMEDOUT'
-        || command === 'CONN'
-        || command === 'EHLO'
-        || command === 'STARTTLS';
-};
-// ============================================
-// CREATE MAIL OPTIONS (Reusable Helper)
-// ============================================
-// Centralizes mail options creation to reduce duplication.
-const createMailOptions = (email, subject, htmlContent, senderEmail, senderName) => {
-    return {
-        from: `${senderName} <${senderEmail}>`,
-        to: email,
-        subject: subject,
-        replyTo: getTrimmedEnv('EMAIL_REPLY_TO') || senderEmail,
-        html: htmlContent,
-    };
-};
-
-// ============================================
-// SEND EMAIL (Reusable Helper)
-// ============================================
-// Unified email sending logic used by both sendEmailOTP and sendEmailVerification.
-// Skips verify() in production for speed, retries on transient errors.
-const sendEmail = async (email, subject, htmlContent, action, context = 'email') => {
-    try {
-        // Validate email configuration
-        if (!getTrimmedEnv('EMAIL_USER') && !getTrimmedEnv('SMTP_URL')) {
-            logger.error('❌ EMAIL_USER or SMTP_URL not configured in .env');
-            throw new apiError(500, 'Email service not configured. Please contact support.');
-        }
-
-        const transporter = getTransporter();
-        const senderEmail = getDefaultSenderEmail();
-        const senderName = getTrimmedEnv('EMAIL_FROM_NAME') || 'ChatApp Support';
-
-        // Development only: verify SMTP connection
-        if (process.env.NODE_ENV !== 'production') {
-            try {
-                logger.log('📧 Development mode: Testing SMTP connection...');
-                await transporter.verify();
-                logger.log('✅ Email service authenticated successfully');
-            } catch (verifyError) {
-                logger.error('❌ Email authentication failed:', {
-                    ...toEmailErrorMeta(verifyError),
-                });
-                
-                // Helpful hints for common issues in development
-                if (verifyError.code === 'ECONNREFUSED' || verifyError.errno === 'ECONNREFUSED') {
-                    logger.error('💡 Cannot connect to SMTP server. Check:');
-                    logger.error('   - SMTP host is correct (smtp.gmail.com for Gmail)');
-                    logger.error('   - SMTP port is correct (587 for TLS)');
-                    logger.error('   - Network/firewall allows outbound SMTP connections');
-                } else if (verifyError.code === 535 || verifyError.message.includes('Invalid login')) {
-                    logger.error('💡 Authentication failed. For Gmail:');
-                    logger.error('   - Use an App Password (not your main password)');
-                    logger.error('   - Get it from: https://myaccount.google.com/apppasswords');
-                    logger.error('   - Enable 2-Factor Authentication first if you haven\'t');
-                } else if (verifyError.code === 'ENOTFOUND' || verifyError.errno === 'ENOTFOUND') {
-                    logger.error('💡 Cannot find SMTP server. Check EMAIL_SERVICE setting.');
-                }
-                
-                throw new apiError(500, 'Email service authentication failed. Check configuration.');
-            }
-        } else {
-            logger.log('📧 Production mode: Skipping SMTP verify; sending email directly');
-        }
-
-        // Create mail options
-        const mailOptions = createMailOptions(email, subject, htmlContent, senderEmail, senderName);
-        
-        // Send with retry logic
-        const result = await sendEmailWithRetry(mailOptions);
-
-        // Log analytics (production only)
-        if (process.env.NODE_ENV === 'production') {
-            logEmailEvent({
-                email,
-                action,
-                status: 'success',
-                messageId: result.messageId,
-                context,
-            });
-        }
-
-        return result;
-
-    } catch (error) {
-        logger.error(`❌ Failed to send ${action} email:`, {
-            email: email,
-            ...toEmailErrorMeta(error),
-        });
-
-        if (isConnectionTimeoutError(error)) {
-            logger.error('⏱️ SMTP timeout detected while delivering Gmail email. The transporter now uses IPv4-only DNS, pooled connections, and extended Render-safe timeouts.', {
-                email,
-                action,
-            });
-        }
-
-        // Log error for analytics (production only)
-        if (process.env.NODE_ENV === 'production') {
-            logEmailEvent({
-                email,
-                action,
-                status: 'failed',
-                error: error?.message,
-                context,
-            });
-        }
-
-        throw error instanceof apiError 
-            ? error 
-            : new apiError(500, `Failed to send ${action} email. Please try again later.`);
-    }
-};
-
-// ============================================
-// SEND EMAIL OTP (Password Reset)
-// ============================================
-export const sendEmailOTP = async (email, otp) => {
-    const subject = getTrimmedEnv('EMAIL_SUBJECT_FORGOT_PASSWORD') || 'Reset Your Password - ChatApp';
-    const htmlContent = getEmailTemplate(otp);
-    return sendEmail(email, subject, htmlContent, 'password_reset_otp', 'forgot-password');
-};
-
-// ============================================
-// SEND EMAIL VERIFICATION (Email Verification)
-// ============================================
-export const sendEmailVerification = async (email, otp) => {
-    const subject = getTrimmedEnv('EMAIL_SUBJECT_VERIFY_EMAIL') || 'Verify Your Email - ChatApp';
-    const htmlContent = getVerificationTemplate(otp);
-    return sendEmail(email, subject, htmlContent, 'email_verification', 'email-change');
+const logEmailEvent = (eventData) => {
+    const timestamp = new Date().toISOString();
+    logger.log('📧 Email Event:', JSON.stringify({ timestamp, ...eventData }));
 };
 
 const getVerificationTemplate = (otp) => `
@@ -674,9 +265,6 @@ const getVerificationTemplate = (otp) => `
     </div>
 `;
 
-// ============================================
-// EMAIL TEMPLATE (Production Grade)
-// ============================================
 const getEmailTemplate = (otp) => {
     return `
         <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f5f7fa;">
@@ -730,90 +318,128 @@ const getEmailTemplate = (otp) => {
     `;
 };
 
-// ============================================
-// EMAIL EVENT LOGGING (for analytics)
-// ============================================
-const logEmailEvent = (eventData) => {
-    const timestamp = new Date().toISOString();
-    const logEntry = {
-        timestamp,
-        ...eventData,
-    };
+export const sendEmail = async ({ email, subject, htmlContent, action, context = 'email' }) => {
+    const recipientEmail = normalizeEmailAddress(email);
 
-    // Log to console
-    logger.log('📧 Email Event:', JSON.stringify(logEntry));
+    try {
+        const mailOptions = buildMailOptions({
+            email: recipientEmail,
+            subject,
+            htmlContent,
+        });
 
-    // TODO: Send to analytics service (DataDog, Mixpanel, etc.)
-    // TODO: Store in database for monitoring
+        const result = await sendEmailWithRetry(mailOptions);
+
+        if (process.env.NODE_ENV === 'production') {
+            logEmailEvent({
+                email: recipientEmail,
+                action,
+                status: 'success',
+                messageId: result?.data?.id || null,
+                context,
+            });
+        }
+
+        return result;
+    } catch (error) {
+        logger.error(`❌ Failed to send ${action} email`, {
+            email: recipientEmail,
+            action,
+            ...toEmailErrorMeta(error),
+        });
+
+        if (process.env.NODE_ENV === 'production') {
+            logEmailEvent({
+                email: recipientEmail,
+                action,
+                status: 'failed',
+                error: error?.message,
+                context,
+            });
+        }
+
+        throw new apiError(500, 'Failed to send email. Please try again later.');
+    }
 };
 
-// ============================================
-// DIAGNOSTIC FUNCTION - Test Email Configuration
-// ============================================
-export const testEmailConfiguration = async () => {
-    console.log('\n🧪 Testing Gmail Configuration...\n');
-    
+export const generateOTP = () => {
+    return Math.floor(100000 + Math.random() * 900000).toString();
+};
+
+export const hashOTP = (otp) => {
+    return crypto.createHash('sha256').update(otp).digest('hex');
+};
+
+export const compareOTP = (inputOTP, storedHashedOTP) => {
+    const hashedInputOTP = hashOTP(inputOTP);
+    return hashedInputOTP === storedHashedOTP;
+};
+
+export const sendEmailOTP = async (email, otp) => {
+    const subject = getTrimmedEnv('EMAIL_SUBJECT_FORGOT_PASSWORD') || DEFAULT_FORGOT_PASSWORD_SUBJECT;
+    const htmlContent = getEmailTemplate(otp);
+    return sendEmail({
+        email,
+        subject,
+        htmlContent,
+        action: 'password_reset_otp',
+        context: 'forgot-password',
+    });
+};
+
+export const sendEmailVerification = async (email, otp) => {
+    const subject = getTrimmedEnv('EMAIL_SUBJECT_VERIFY_EMAIL') || DEFAULT_VERIFY_SUBJECT;
+    const htmlContent = getVerificationTemplate(otp);
+    return sendEmail({
+        email,
+        subject,
+        htmlContent,
+        action: 'email_verification',
+        context: 'email-change',
+    });
+};
+
+export const verifyTransporterHealth = async () => {
     try {
-        const emailUser = getTrimmedEnv('EMAIL_USER');
-        
-        console.log(`📧 Gmail User: ${emailUser || '(not configured)'}`);
-        console.log(`📧 Node Environment: ${process.env.NODE_ENV || 'development'}`);
-        
-        // Test configuration
-        if (!emailUser) {
-            console.error('\n❌ ERROR: EMAIL_USER not configured in .env');
-            return false;
-        }
-        
-        console.log('\n🔗 Creating Gmail transporter...');
-        const transporter = getTransporter();
-        console.log('✅ Transporter created');
-        
-        console.log('\n🔑 Verifying SMTP connection...');
-        await transporter.verify();
-        console.log('✅ SMTP connection verified and authenticated successfully!');
-        
-        console.log('\n📤 Sending test email...');
-        const result = await transporter.sendMail({
-            from: `ChatApp <${emailUser}>`,
-            to: emailUser,
-            subject: 'ChatApp - Gmail Configuration Test',
-            html: '<h1>✅ Gmail Configuration Works!</h1><p>You can now use ChatApp email features.</p>',
-        });
-        console.log(`✅ Test email sent! Message ID: ${result.messageId}`);
-        
-        console.log('\n🎉 Gmail configuration is working correctly!\n');
+        getResendClient();
+        const { fromEmail } = getSenderConfig();
+        logger.log('✅ Resend email configuration is ready', { fromEmail });
         return true;
-        
     } catch (error) {
-        console.error('\n❌ Gmail configuration test failed!');
+        logger.error('❌ Resend health check failed', toEmailErrorMeta(error));
+        return false;
+    }
+};
+
+export const testEmailConfiguration = async () => {
+    console.log('\n🧪 Testing Resend Configuration...\n');
+
+    try {
+        const { fromEmail, fromName } = getSenderConfig();
+        const probeEmail = getTrimmedEnv('EMAIL_REPLY_TO') || fromEmail;
+
+        console.log(`📧 From: ${fromName} <${fromEmail}>`);
+        console.log(`📧 Test recipient: ${probeEmail}`);
+        console.log(`📧 Node Environment: ${process.env.NODE_ENV || 'development'}`);
+
+        await sendEmail({
+            email: probeEmail,
+            subject: 'ChatApp - Resend Configuration Test',
+            htmlContent: '<h1>✅ Resend Configuration Works!</h1><p>You can now use ChatApp email features.</p>',
+            action: 'configuration_test',
+            context: 'diagnostic',
+        });
+
+        console.log('\n🎉 Resend configuration is working correctly!\n');
+        return true;
+    } catch (error) {
+        console.error('\n❌ Resend configuration test failed!');
         console.error(`Error: ${error.message}\n`);
-        
-        if (error.code === 'ECONNREFUSED') {
-            console.error('💡 Cannot connect to SMTP server. Possible causes:');
-            console.error('   - SMTP server is down');
-            console.error('   - Wrong SMTP host or port');
-            console.error('   - Network/firewall blocking connection');
-        } else if (error.code === 535 || error.message.includes('Invalid login')) {
-            console.error('💡 Authentication failed. For Gmail:');
-            console.error('   - Use an App Password from: https://myaccount.google.com/apppasswords');
-            console.error('   - NOT your main Gmail password');
-            console.error('   - Make sure 2-Factor Authentication is enabled first');
-        } else if (error.code === 'ENOTFOUND') {
-            console.error('💡 Cannot find SMTP server (DNS issue or wrong host)');
-        } else if (error.code === 'ETIMEDOUT') {
-            console.error('💡 Connection timeout. Firewall or network issue blocking SMTP port 587');
-        } else if (error.code === 'ENETUNREACH' || error.code === 'ESOCKET') {
-            console.error('💡 Network unreachable. Possible causes:');
-            console.error('   - IPv6 routing issue (common on Render)');
-            console.error('   - Firewall blocking outbound SMTP');
-            console.error('   - ISP network issue');
-        }
-        
-        console.error('\nDebugging info:');
-        console.error(`Code: ${error.code}`);
-        console.error(`Message: ${error.message}`);
-        
+        console.error('Debugging info:');
+        console.error(`Name: ${error?.name}`);
+        console.error(`Code: ${error?.code}`);
+        console.error(`Status: ${error?.statusCode ?? error?.status}`);
+        console.error(`Message: ${error?.message}`);
         return false;
     }
 };
