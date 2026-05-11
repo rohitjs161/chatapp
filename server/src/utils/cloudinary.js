@@ -52,28 +52,41 @@ const extractCloudinaryAssetMeta = (fileUrl) => {
 // --------------------------------------------------
 const uploadOnCloudinary = async (localFilePath) => {
     try {
-        if (!localFilePath) return null
+        if (!localFilePath) return null;
 
-        const response = await cloudinary.uploader.upload(localFilePath,{
-            resource_type: "auto"
+        // Resolve relative paths to absolute to avoid ENOENT due to cwd differences
+        const resolvedPath = path.isAbsolute(localFilePath) ? localFilePath : path.resolve(process.cwd(), localFilePath);
+
+        if (!fs.existsSync(resolvedPath)) {
+            logger.error('❌ Cloudinary upload error: local file not found', resolvedPath);
+            return null;
+        }
+
+        const response = await cloudinary.uploader.upload(resolvedPath, {
+            resource_type: "auto",
         });
 
         // Delete local file after successful upload
-        if (fs.existsSync(localFilePath)) {
-            fs.unlinkSync(localFilePath);
-            logger.log(`✅ Local file deleted: ${localFilePath}`);
+        if (fs.existsSync(resolvedPath)) {
+            fs.unlinkSync(resolvedPath);
+            logger.log(`✅ Local file deleted: ${resolvedPath}`);
         }
 
         return response;
     } catch (error) {
-        logger.error("❌ Cloudinary upload error:", error.message);
+        logger.error("❌ Cloudinary upload error:", error?.message || error);
         // Delete local file in case of error
-        if (fs.existsSync(localFilePath)) {
-            fs.unlinkSync(localFilePath);
+        try {
+            const resolvedPath = path.isAbsolute(localFilePath) ? localFilePath : path.resolve(process.cwd(), localFilePath);
+            if (fs.existsSync(resolvedPath)) {
+                fs.unlinkSync(resolvedPath);
+            }
+        } catch (e) {
+            logger.warn('⚠️ Failed to remove local file after upload error', e?.message || e);
         }
         return null;
     }
-}
+};
 
 // --------------------------------------------------
 // DELETE FILE FROM CLOUDINARY

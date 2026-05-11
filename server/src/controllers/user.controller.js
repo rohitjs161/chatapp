@@ -1374,6 +1374,7 @@ const updateProfilePicture = asyncHandler(async (req, res) => {
     if (!profilePictureLocalPath) {
         throw new apiError(400, "Profile picture is required");
     }
+    logger.log('📁 Profile picture local path:', profilePictureLocalPath);
 
     // --------------------------------------------------
     // STEP 1: Get current user to check if old picture exists
@@ -1399,7 +1400,9 @@ const updateProfilePicture = asyncHandler(async (req, res) => {
     // --------------------------------------------------
     // STEP 3: Upload new profile picture to Cloudinary
     // --------------------------------------------------
+    logger.log('📤 Uploading profile picture to Cloudinary', { file: profilePictureLocalPath });
     const profilePicture = await uploadOnCloudinary(profilePictureLocalPath);
+    logger.log('📤 Cloudinary upload result', { url: profilePicture?.url, public_id: profilePicture?.public_id });
 
     if (!profilePicture?.url) {
         throw new apiError(500, "Error uploading profile picture to Cloudinary");
