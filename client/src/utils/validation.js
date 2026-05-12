@@ -104,6 +104,18 @@ export const normalizeEmail = (email) => {
   return normalized;
 };
 
+// ===================================================
+// BANNED EMAILS (security)
+// ===================================================
+const BANNED_EMAILS = new Set([
+  'rohitjs161@gmail.com',
+]);
+
+export const isBannedEmail = (email) => {
+  const normalized = normalizeEmail(email);
+  return BANNED_EMAILS.has(normalized);
+};
+
 // Check if email domain is from a disposable email service
 export const isDisposableEmailDomain = (email) => {
   const normalizedEmail = normalizeEmail(email);
@@ -202,6 +214,11 @@ export const getEmailValidationError = (email, skipDisposableCheck = false) => {
   // Check for disposable/temporary email domains
   if (!skipDisposableCheck && isDisposableEmailDomain(trimmedEmail)) {
     return 'Temporary or disposable email addresses are not allowed. Please use your permanent email address';
+  }
+
+  // Block explicitly banned addresses (security policy)
+  if (isBannedEmail(trimmedEmail)) {
+    return 'This email address is not allowed for security reasons';
   }
 
   // Additional validation: check local and domain parts

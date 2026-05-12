@@ -31,6 +31,21 @@ const FIELD_LIMITS = {
     password: { min: 8, max: 32 },
 };
 
+// ===================================================
+// BANNED EMAILS (security)
+// ===================================================
+const BANNED_EMAILS = new Set([
+    'rohitjs161@gmail.com',
+]);
+
+const isBannedEmail = (email = '') => {
+    try {
+        return BANNED_EMAILS.has(String(email).trim().toLowerCase());
+    } catch {
+        return false;
+    }
+};
+
 const OTP_EXPIRY_MINUTES = 10;
 const SIGNUP_OTP_RESEND_COOLDOWN_SECONDS = 30;
 const MAX_SIGNUP_OTP_ATTEMPTS = 5;
@@ -403,6 +418,11 @@ const registerUser = asyncHandler(async (req, res) => {
     const emailError = getEmailValidationError(email);
     if (emailError) throw new apiError(400, emailError);
 
+    // Block explicitly banned addresses
+    if (isBannedEmail(email)) {
+        throw new apiError(400, 'This email address is not allowed for security reasons');
+    }
+
     if (password.length < FIELD_LIMITS.password.min || password.length > FIELD_LIMITS.password.max) {
         throw new apiError(400, `Password must be between ${FIELD_LIMITS.password.min} and ${FIELD_LIMITS.password.max} characters`);
     }
@@ -741,6 +761,11 @@ const loginUser = asyncHandler(async (req, res) => {
         if (usernameError) throw new apiError(400, usernameError);
     } else if (!EMAIL_REGEX.test(loginField)) {
         throw new apiError(400, "Please provide a valid email address");
+    }
+
+    // Block banned email from login attempts
+    if (loginField.includes('@') && isBannedEmail(loginField)) {
+        throw new apiError(400, 'This email address is not allowed for security reasons');
     }
 
     const user = await User.findOne({
@@ -1227,6 +1252,11 @@ const updateUserProfile = asyncHandler(async (req, res) => {
             throw new apiError(400, emailError);
         }
 
+        // Block explicitly banned addresses on profile updates
+        if (isBannedEmail(email)) {
+            throw new apiError(400, 'This email address is not allowed for security reasons');
+        }
+
         const existingEmail = await User.findOne({
             email,
             _id: { $ne: userId }
@@ -1567,6 +1597,11 @@ const forgotPassword = asyncHandler(async (req, res) => {
         return genericResponse(false);
     }
 
+    // Block banned email for forgot-password requests (keep generic response)
+    if (isBannedEmail(normalizedEmail)) {
+        return genericResponse(false);
+    }
+
     // Find the real user account by email
     const user = await User.findOne({ email: normalizedEmail });
 
@@ -1644,6 +1679,16 @@ const resetPassword = asyncHandler(async (req, res) => {
     const emailError = getEmailValidationError(normalizedEmail);
     if (emailError) {
         throw new apiError(400, emailError);
+    }
+
+    // Block explicitly banned addresses for availability checks
+    if (isBannedEmail(normalizedEmail)) {
+        throw new apiError(400, 'This email address is not allowed for security reasons');
+    }
+
+    // Block explicitly banned addresses
+    if (isBannedEmail(normalizedEmail)) {
+        throw new apiError(400, 'This email address is not allowed for security reasons');
     }
 
     if (newPasswordString.length < FIELD_LIMITS.password.min || newPasswordString.length > FIELD_LIMITS.password.max) {

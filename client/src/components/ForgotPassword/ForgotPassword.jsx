@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { forgotPassword } from '../../api/auth.api.js';
+import { isBannedEmail } from '../../utils/validation.js';
 import '../../styles/ForgotPassword.css';
 
 const ForgotPassword = () => {
@@ -31,6 +32,12 @@ const ForgotPassword = () => {
             const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
             if (!emailRegex.test(email)) {
                 setError('Please enter a valid email address (e.g., user@example.com)');
+                setLoading(false);
+                return;
+            }
+
+            if (isBannedEmail(email)) {
+                setError('This email address is not allowed for security reasons');
                 setLoading(false);
                 return;
             }
