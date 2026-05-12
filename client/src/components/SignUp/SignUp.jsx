@@ -10,6 +10,7 @@ import {
 } from '../../utils/validation.js';
 import { checkEmailExists, checkUsernameExists } from '../../api/auth.api.js';
 import { getGoogleAuthUrl } from '../../utils/authLinks.js';
+import PoliciesModal from '../../components/Policies/PoliciesModal'
 
 const FIELD_LIMITS = {
   fullName: 50,
@@ -27,6 +28,7 @@ const SignUp = () => {
   const { register, isLoading, error, clearError } = useAuthStore();
   const { isLocked: isSubmitting, runLockedAction } = useActionLock();
   const [isGoogleRedirecting, setIsGoogleRedirecting] = useState(false);
+  const [policiesOpen, setPoliciesOpen] = useState(null) // null | 'terms' | 'privacy'
   
   const [formData, setFormData] = useState({
     fullName: '',
@@ -211,7 +213,17 @@ const SignUp = () => {
     }
   };
 
+  const handleAcceptPolicies = ({ version } = {}) => {
+    // mark checkbox and persist acceptance for audit (localStorage)
+    setFormData((prev) => ({ ...prev, agreeToTerms: true }))
+    try {
+      const accepted = { version: version || 'unknown', timestamp: new Date().toISOString() }
+      localStorage.setItem('policiesAccepted', JSON.stringify(accepted))
+    } catch {}
+  }
+
   return (
+    <>
     <div
       className="relative h-screen overflow-y-auto bg-gradient-to-br from-slate-50 via-blue-50 to-indigo-100 px-4 py-6 sm:px-6 sm:py-8 lg:px-8"
       style={{ height: '100dvh' }}
@@ -345,7 +357,7 @@ const SignUp = () => {
                     className="mt-1 h-4 w-4 rounded border border-slate-300 text-blue-600 focus:ring-blue-500"
                   />
                   <label htmlFor="agreeToTerms" className="select-none text-xs text-slate-700 md:text-sm">
-                    I agree to the <a href="#" className="font-medium text-blue-600 hover:text-blue-800">Terms & Privacy Policy</a>
+                    I agree to the <button type="button" onClick={() => setPoliciesOpen('terms')} className="inline font-medium text-blue-600 hover:text-blue-800">Terms</button> &amp; <button type="button" onClick={() => setPoliciesOpen('privacy')} className="inline font-medium text-blue-600 hover:text-blue-800">Privacy Policy</button>
                   </label>
                 </div>
               </div>
@@ -396,7 +408,13 @@ const SignUp = () => {
         </div>
       </div>
     </div>
+      <PoliciesModal open={Boolean(policiesOpen)} onClose={() => setPoliciesOpen(null)} initialTab={policiesOpen || 'terms'} onAccept={handleAcceptPolicies} />
+    </>
   );
 };
 
 export default SignUp;
+
+// Local modal insertion so it's available on the SignUp page without routing
+// (Note: import is at top of file)
+// Render modal at end of file via portal-like inline inclusion
