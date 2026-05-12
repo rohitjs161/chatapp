@@ -1,5 +1,6 @@
 import {v2 as cloudinary} from "cloudinary";
 import fs from "fs"
+import path from "path"
 import { logger } from "./logger.js";
 
 cloudinary.config({ 
@@ -62,17 +63,25 @@ const uploadOnCloudinary = async (localFilePath) => {
             return null;
         }
 
-        const response = await cloudinary.uploader.upload(resolvedPath, {
-            resource_type: "auto",
-        });
+            const response = await cloudinary.uploader.upload(resolvedPath, {
+                resource_type: "auto",
+            });
 
-        // Delete local file after successful upload
-        if (fs.existsSync(resolvedPath)) {
-            fs.unlinkSync(resolvedPath);
-            logger.log(`✅ Local file deleted: ${resolvedPath}`);
-        }
+            // Delete local file after successful upload
+            if (fs.existsSync(resolvedPath)) {
+                try {
+                    fs.unlinkSync(resolvedPath);
+                    logger.log(`✅ Local file deleted: ${resolvedPath}`);
+                } catch (e) {
+                    logger.warn('⚠️ Failed to delete local file after upload', e?.message || e);
+                }
+            }
 
-        return response;
+            // Normalize response for callers: provide `url` and `public_id`
+            const url = response?.secure_url || response?.url || response?.secure_url_https || null;
+            const public_id = response?.public_id || response?.publicId || null;
+
+            return { ...response, url, public_id };
     } catch (error) {
         logger.error("❌ Cloudinary upload error:", error?.message || error);
         // Delete local file in case of error
