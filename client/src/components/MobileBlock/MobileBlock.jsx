@@ -1,6 +1,6 @@
 const MobileBlock = () => {
     return (
-        <div className="relative min-h-[100dvh] overflow-y-auto bg-[radial-gradient(circle_at_top_left,_rgba(59,130,246,0.22),_transparent_30%),radial-gradient(circle_at_top_right,_rgba(168,85,247,0.18),_transparent_28%),linear-gradient(180deg,_#f8fbff_0%,_#eef2ff_100%)] px-4 py-6 sm:px-6 sm:py-8 lg:flex lg:items-center lg:justify-center lg:py-10">
+        <div className="relative min-h-[100dvh] overflow-x-hidden overflow-y-auto bg-[radial-gradient(circle_at_top_left,_rgba(59,130,246,0.22),_transparent_30%),radial-gradient(circle_at_top_right,_rgba(168,85,247,0.18),_transparent_28%),linear-gradient(180deg,_#f8fbff_0%,_#eef2ff_100%)] px-4 py-6 sm:px-6 sm:py-8 lg:flex lg:items-center lg:justify-center lg:py-10">
             <div className="pointer-events-none absolute inset-x-0 top-0 h-64 bg-[linear-gradient(180deg,_rgba(15,23,42,0.06),_transparent)]" />
             <div className="pointer-events-none absolute left-[-6rem] top-10 h-44 w-44 rounded-full bg-blue-400/25 blur-3xl" />
             <div className="pointer-events-none absolute bottom-4 right-[-4rem] h-56 w-56 rounded-full bg-fuchsia-400/20 blur-3xl" />
