@@ -266,6 +266,9 @@ const getCookieOptions = () => {
         // Use 'none' for cross-origin requests with credentials (frontend + backend on different domains)
         // Use 'lax' for same-origin in development
         sameSite: isProduction ? "none" : "lax",
+        path: '/',
+        // Optional: allow overriding cookie domain in production when using cross-subdomains
+        ...(process.env.REFRESH_TOKEN_COOKIE_DOMAIN ? { domain: process.env.REFRESH_TOKEN_COOKIE_DOMAIN } : {}),
     };
 };
 
