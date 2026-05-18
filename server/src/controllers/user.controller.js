@@ -1079,6 +1079,18 @@ const deleteAccount = asyncHandler(async (req, res) => {
 
 const refreshAccessToken = asyncHandler(async (req, res) => {
     try {
+        // Diagnostic info: log request origin details to help diagnose missing cookies
+        const requestOrigin = req.headers?.origin || req.headers?.referer || null;
+        const hostHeader = req.headers?.host || null;
+        const cookieHeaderPresent = Boolean(req.headers?.cookie);
+        const proto = req.secure || req.headers['x-forwarded-proto'] || req.protocol;
+        logger.log('🔍 Refresh token request info', {
+            origin: requestOrigin,
+            host: hostHeader,
+            proto,
+            cookieHeaderPresent,
+        });
+
         // STEP 1: Extract refresh token from multiple locations (cookies preferred)
         // Prefer HTTP-only cookie, but accept body or Authorization header as graceful fallback
         const cookieToken = req.cookies?.refreshToken;
@@ -1090,6 +1102,8 @@ const refreshAccessToken = asyncHandler(async (req, res) => {
 
         if (!incomingRefreshToken) {
             logger.log('⚠️  No refresh token found (cookie/body/header)');
+            // Add a hint for production debugging (do not expose sensitive data)
+            logger.warn('Possible causes: cookies blocked by SameSite/secure/domain, missing credentials on client, or wrong API origin.');
             throw new apiError(401, "No refresh token provided");
         }
 
