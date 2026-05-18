@@ -2,6 +2,8 @@ import { create } from "zustand";
 import { connectSocket, disconnectSocket } from "../socket/socket.js";
 import { getCurrentUser, loginUser, logoutUser, refreshSession, registerUser } from "../api/auth.api.js";
 import { logger } from "../utils/logger.js";
+import { sanitizeUserData } from "../utils/sanitizeUser.js";
+import { clearAccessToken, getAccessToken, setAccessToken } from "./authToken.js";
 
 export const AUTH_SYNC_KEY = "chatapp:auth-sync";
 const AUTH_SYNC_CHANNEL = "chatapp-auth-sync";
@@ -9,6 +11,12 @@ const AUTH_SYNC_CHANNEL = "chatapp-auth-sync";
 const authChannel = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel(AUTH_SYNC_CHANNEL) : null;
 const BOOTSTRAP_RETRY_DELAY_MS = 350;
 const BOOTSTRAP_MAX_RETRIES = 3;
+
+if (typeof localStorage !== "undefined") {
+    localStorage.removeItem("accessToken");
+    localStorage.removeItem("user");
+    localStorage.removeItem("refreshToken");
+}
 
 // Prevent concurrent refresh-token requests (rate limit guard)
 let bootstrapPromise = null;
@@ -19,8 +27,6 @@ const isUnauthenticatedRefreshError = (error) => {
     const status = error?.response?.status;
     return status === 401 || status === 403;
 };
-
-const hasStoredRefreshToken = () => Boolean(localStorage.getItem("refreshToken"));
 
 const preloadProfilePicture = (profilePicture) => {
     if (!profilePicture || typeof profilePicture !== "string") return;
@@ -38,6 +44,7 @@ const clearAuthSession = () => {
     localStorage.removeItem("accessToken");
     localStorage.removeItem("refreshToken");
     localStorage.removeItem("user");
+    clearAccessToken();
     disconnectSocket();
 };
 
@@ -79,8 +86,8 @@ const getApiErrorMessage = (error, fallbackMessage) => {
 };
 
 const useAuthStore = create((set) => ({
-    user: JSON.parse(localStorage.getItem("user")) || null,
-    accessToken: localStorage.getItem("accessToken") || null,
+    user: null,
+    accessToken: getAccessToken(),
     isLoading: false,
     isBootstrapping: false,
     hasBootstrapped: false,
@@ -111,17 +118,15 @@ const useAuthStore = create((set) => ({
                 throw new Error(message);
             }
 
-            const { user, accessToken, refreshToken } = response.data;
+            const { user, accessToken } = response.data;
 
-            localStorage.setItem("accessToken", accessToken);
-            localStorage.setItem("refreshToken", refreshToken);
-            localStorage.setItem("user", JSON.stringify(user));
+            setAccessToken(accessToken);
 
             preloadProfilePicture(user?.profilePicture);
 
             connectSocket(accessToken);
 
-            set({ user, accessToken, isBootstrapping: false, hasBootstrapped: true, error: null });
+            set({ user: sanitizeUserData(user), accessToken, isBootstrapping: false, hasBootstrapped: true, error: null });
             return response;
         } catch (error) {
             const message = getApiErrorMessage(error, "Login failed");
@@ -172,7 +177,6 @@ const useAuthStore = create((set) => ({
                     try {
                         const userResponse = await getCurrentUser();
                         currentUser = userResponse.data;
-                        localStorage.setItem("user", JSON.stringify(currentUser));
                         preloadProfilePicture(currentUser?.profilePicture);
                     } catch (error) {
                         if (!isUnauthenticatedRefreshError(error)) {
@@ -186,24 +190,20 @@ const useAuthStore = create((set) => ({
                         }
 
                         const sessionResponse = await refreshSession();
-                        const { accessToken: refreshedAccessToken, refreshToken: refreshedRefreshToken } = sessionResponse.data || {};
+                        const { accessToken: refreshedAccessToken } = sessionResponse.data || {};
 
                         if (!refreshedAccessToken) {
                             throw new Error("Access token missing from session refresh");
                         }
 
-                        localStorage.setItem("accessToken", refreshedAccessToken);
-                        if (refreshedRefreshToken) {
-                            localStorage.setItem("refreshToken", refreshedRefreshToken);
-                        }
+                        setAccessToken(refreshedAccessToken);
 
                         const retryUserResponse = await getCurrentUser();
                         currentUser = retryUserResponse.data;
-                        localStorage.setItem("user", JSON.stringify(currentUser));
                         preloadProfilePicture(currentUser?.profilePicture);
 
                         set({
-                            user: currentUser,
+                            user: sanitizeUserData(currentUser),
                             accessToken: refreshedAccessToken,
                             isBootstrapping: false,
                             hasBootstrapped: true,
@@ -223,21 +223,13 @@ const useAuthStore = create((set) => ({
                 return true;
             }
 
-            // No access token - only try session refresh when we still have a stored refresh token.
-            // After logout we clear local auth state, so reloading as an anonymous user should not hit refresh-token.
-            if (!force && !hasStoredRefreshToken()) {
-                clearAuthSession();
-                set({ user: null, accessToken: null, isBootstrapping: false, hasBootstrapped: true, error: null });
-                return false;
-            }
-
-            // Try to refresh from cookies with a few retries.
+            // No access token - try a cookie-based session refresh with a few retries.
             let lastError = null;
 
             for (let attempt = 0; attempt < BOOTSTRAP_MAX_RETRIES; attempt += 1) {
                 try {
                     const sessionResponse = await refreshSession();
-                    const { accessToken: freshAccessToken, refreshToken: freshRefreshToken } = sessionResponse.data || {};
+                    const { accessToken: freshAccessToken } = sessionResponse.data || {};
 
                     if (!freshAccessToken) {
                         throw new Error("Access token missing from session refresh");
@@ -246,16 +238,12 @@ const useAuthStore = create((set) => ({
                     const userResponse = await getCurrentUser();
                     const currentUser = userResponse.data;
 
-                    localStorage.setItem("accessToken", freshAccessToken);
-                    if (freshRefreshToken) {
-                        localStorage.setItem("refreshToken", freshRefreshToken);
-                    }
-                    localStorage.setItem("user", JSON.stringify(currentUser));
+                    setAccessToken(freshAccessToken);
                     preloadProfilePicture(currentUser?.profilePicture);
 
                     // Finalize auth state FIRST (don't wait for socket)
                     set({
-                        user: currentUser,
+                        user: sanitizeUserData(currentUser),
                         accessToken: freshAccessToken,
                         isBootstrapping: false,
                         hasBootstrapped: true,
@@ -304,9 +292,8 @@ const useAuthStore = create((set) => ({
     },
 
     updateUser: (updatedUser) => {
-        localStorage.setItem("user", JSON.stringify(updatedUser));
         preloadProfilePicture(updatedUser?.profilePicture);
-        set({ user: updatedUser });
+        set({ user: sanitizeUserData(updatedUser) });
     },
 
     clearError: () => set({ error: null }),

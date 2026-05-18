@@ -1,4 +1,4 @@
-import React, { useEffect } from "react";
+import React, { useEffect, useState } from "react";
 import LeftSidebar from "../LeftSidebar/LeftSidebar";
 import ChatContainer from "../ChatContainer/ChatContainer";
 import RightSidebar from "../RightSidebar/RightSidebar";
@@ -6,6 +6,7 @@ import useConversationStore from "../../store/conversation.store.js";
 import { getSocket } from "../../socket/socket.js";
 
 const ChatHome = () => {
+    const [isRightSidebarOpen, setIsRightSidebarOpen] = useState(false);
     const {
         selectedConversation,
         selectConversation,
@@ -74,27 +75,46 @@ const ChatHome = () => {
         };
     }, [setConversationUnreadCount, updateConversationRequestState]);
 
-    const homeGridClassName = selectedConversation
-        ? "grid h-dvh grid-cols-1 bg-slate-100 md:grid-cols-[minmax(260px,320px)_minmax(0,1fr)] xl:grid-cols-[minmax(280px,320px)_minmax(0,1fr)_minmax(280px,360px)] overflow-hidden"
-        : "grid h-dvh grid-cols-1 bg-slate-100 md:grid-cols-[minmax(260px,320px)_minmax(0,1fr)] xl:grid-cols-[minmax(280px,320px)_minmax(0,1fr)] overflow-hidden";
+    useEffect(() => {
+        if (!selectedConversation) {
+            setIsRightSidebarOpen(false);
+        }
+    }, [selectedConversation]);
+
+    const homeGridClassName = "grid h-dvh grid-cols-1 bg-slate-100 md:grid-cols-[minmax(271px,331px)_minmax(0,1fr)] overflow-hidden";
 
     return (
         <div className={homeGridClassName}>
             <main className="order-1 min-w-0 overflow-hidden md:order-2">
-                <ChatContainer />
+                <ChatContainer onToggleRightSidebar={() => setIsRightSidebarOpen((current) => !current)} />
             </main>
 
             <aside className="order-2 min-w-0 overflow-hidden md:order-1 md:border-r md:border-slate-200">
                 <LeftSidebar
                     onUserSelect={selectConversation}
                     selectedUser={selectedConversation}
+                    onToggleRightSidebar={() => setIsRightSidebarOpen((current) => !current)}
                 />
             </aside>
 
             {selectedConversation && (
-                <aside className="hidden min-w-0 overflow-hidden xl:order-3 xl:flex xl:border-l xl:border-slate-200">
-                    <RightSidebar selectedConversation={selectedConversation} />
-                </aside>
+                <>
+                    <button
+                        type="button"
+                        aria-label="Close contact info"
+                        onClick={() => setIsRightSidebarOpen(false)}
+                        className={`fixed inset-0 z-30 bg-slate-950/35 transition-opacity duration-300 md:left-[271px] ${isRightSidebarOpen ? 'pointer-events-auto opacity-100' : 'pointer-events-none opacity-0'}`}
+                    />
+
+                    <aside
+                        className={`fixed right-0 top-0 z-40 h-dvh w-full max-w-[360px] overflow-hidden border-l border-slate-200 bg-white shadow-2xl transition-transform duration-300 ease-out ${isRightSidebarOpen ? 'translate-x-0' : 'translate-x-full'}`}
+                    >
+                        <RightSidebar
+                            selectedConversation={selectedConversation}
+                            onClose={() => setIsRightSidebarOpen(false)}
+                        />
+                    </aside>
+                </>
             )}
         </div>
     );

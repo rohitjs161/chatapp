@@ -4,11 +4,11 @@ import jwt from 'jsonwebtoken';
 import {
     getAboutValidationError,
     getFullNameValidationError,
+    getUsernameValidationError,
     normalizeAboutText,
     normalizeFullName,
+    normalizeUsername,
 } from '../utils/validation.js';
-
-const USERNAME_REGEX = /^[a-zA-Z0-9._]+$/;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const userSchema = new Schema({
@@ -25,21 +25,11 @@ const userSchema = new Schema({
         type: String,
         required: true,
         unique: true,
-        trim: true,
-        lowercase: true,
-        minlength: 3,
-        maxlength: 20,
-        match: [USERNAME_REGEX, 'Username can only use letters, numbers, periods, and underscores'],
-        validate: [
-            {
-                validator: (value) => !/^[._]|[._]$/.test(value),
-                message: 'Username cannot start or end with a period or underscore',
-            },
-            {
-                validator: (value) => !/\.\./.test(value),
-                message: 'Username cannot contain consecutive periods',
-            },
-        ],
+        set: (value) => normalizeUsername(value),
+        validate: {
+            validator: (value) => !getUsernameValidationError(value),
+            message: 'Invalid username',
+        },
     },
     email: {
         type: String,

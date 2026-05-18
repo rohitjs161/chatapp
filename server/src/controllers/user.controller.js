@@ -11,8 +11,10 @@ import { uploadOnCloudinary, deleteFromCloudinary, deleteFromCloudinaryByPublicI
 import {
     getAboutValidationError,
     getFullNameValidationError,
+    getUsernameValidationError,
     normalizeAboutText,
     normalizeFullName,
+    normalizeUsername,
     sanitizeAboutText,
     getEmailValidationError,
     normalizeEmail,
@@ -20,14 +22,13 @@ import {
 import { emitToUserRoom } from '../socket/io.js';
 import { generateOTP, hashOTP, compareOTP, sendEmailOTP, sendEmailVerification } from '../utils/otp.js';
 import { logger } from "../utils/logger.js";
+import { SAFE_USER_SELECT, toSafeUserResponse } from "../utils/safeUser.js";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const USERNAME_REGEX = /^[a-zA-Z0-9._]+$/;
 const PASSWORD_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z\d]).+$/;
 
 const FIELD_LIMITS = {
     fullName: { min: 2, max: 50 },
-    username: { min: 3, max: 20 },
     password: { min: 8, max: 32 },
 };
 
@@ -83,6 +84,8 @@ const getBlockedMinutesRemaining = (blockedUntil) => {
 
     return Math.max(0, Math.ceil((blockedUntilMs - Date.now()) / (1000 * 60)));
 };
+
+const safeUser = (user) => toSafeUserResponse(user);
 
 const isBlockActive = (blockedUntil) => {
     const blockedUntilMs = new Date(blockedUntil || 0).getTime();
@@ -241,7 +244,7 @@ const throwDuplicateFieldError = (error, attemptedEmail, attemptedUsername) => {
 
     if (duplicateField === 'username') {
         logger.log(`❌ Username duplicate detected: ${attemptedUsername}`);
-        throw new apiError(409, 'This username is already taken. Please choose a different username.');
+        throw new apiError(409, 'Username already exists');
     }
 
     // Fallback: If we can't determine field, it's likely a race condition
@@ -253,34 +256,6 @@ const throwDuplicateFieldError = (error, attemptedEmail, attemptedUsername) => {
         409, 
         'It looks like this email or username was just registered. Please try again with different credentials.'
     );
-};
-
-const getUsernameValidationError = (username = '') => {
-    const normalizedUsername = String(username || '').trim().toLowerCase();
-
-    if (!normalizedUsername) return 'Username is required';
-
-    if (normalizedUsername.length < FIELD_LIMITS.username.min || normalizedUsername.length > FIELD_LIMITS.username.max) {
-        return `Username must be between ${FIELD_LIMITS.username.min} and ${FIELD_LIMITS.username.max} characters`;
-    }
-
-    if (/\s/.test(normalizedUsername)) {
-        return 'Username cannot contain spaces';
-    }
-
-    if (!USERNAME_REGEX.test(normalizedUsername)) {
-        return 'Username can only use letters, numbers, periods, and underscores';
-    }
-
-    if (/^[._]|[._]$/.test(normalizedUsername)) {
-        return 'Username cannot start or end with a period or underscore';
-    }
-
-    if (/\.\./.test(normalizedUsername)) {
-        return 'Username cannot contain consecutive periods';
-    }
-
-    return '';
 };
 
 const getCookieOptions = () => {
@@ -301,7 +276,7 @@ const getFrontendOrigin = () => {
 
 const normalizeRegisterPayload = (payload = {}) => ({
     fullName: typeof payload.fullName === 'string' ? payload.fullName : '',
-    username: String(payload.username || '').trim().toLowerCase(),
+    username: normalizeUsername(payload.username),
     email: String(payload.email || '').trim().toLowerCase(),
     password: String(payload.password || ''),
     confirmPassword: String(payload.confirmPassword || ''),
@@ -314,7 +289,7 @@ const normalizeLoginPayload = (payload = {}) => ({
 
 const normalizeProfilePayload = (payload = {}) => ({
     fullName: typeof payload.fullName === 'string' ? payload.fullName : '',
-    username: typeof payload.username === 'string' ? payload.username.trim().toLowerCase() : '',
+    username: normalizeUsername(payload.username),
     email: typeof payload.email === 'string' ? payload.email.trim().toLowerCase() : '',
     bio: typeof payload.bio === 'string' ? payload.bio : undefined,
 });
@@ -400,7 +375,7 @@ const registerUser = asyncHandler(async (req, res) => {
     const fullName = normalizeFullName(rawFullName);
 
     if (
-        [fullName, username, email, password, confirmPassword].some((field) => field?.trim() === "")
+        [fullName, email, password, confirmPassword].some((field) => field?.trim() === "")
     ) {
         throw new apiError(400, "All fields are required");
     }
@@ -449,7 +424,7 @@ const registerUser = asyncHandler(async (req, res) => {
     }
 
     if (usernameExists) {
-        throw new apiError(409, 'This username is already taken. Please choose a different username.');
+        throw new apiError(409, 'Username already exists');
     }
 
     let pendingRegistration;
@@ -726,7 +701,7 @@ const registerUser = asyncHandler(async (req, res) => {
             }
 
             if (freshUsernameUser) {
-                throw new apiError(409, 'This username is already taken. Please choose a different username.');
+                throw new apiError(409, 'Username already exists');
             }
 
             throwDuplicateFieldError(error, emailNormalized, usernameNormalized);
@@ -817,7 +792,7 @@ const loginUser = asyncHandler(async (req, res) => {
 
     const { accessToken, refreshToken } = await generateAccessAndRefreshTokens(user._id);
 
-    const loggedInUser = await User.findById(user._id).select("-password -refreshToken -profilePicturePublicId");
+    const loggedInUser = await User.findById(user._id).select(SAFE_USER_SELECT);
 
     const cookieOptions = getCookieOptions();
 
@@ -834,7 +809,7 @@ const loginUser = asyncHandler(async (req, res) => {
         .json(
             new apiResponse(
                 200,
-                { user: loggedInUser, accessToken, refreshToken },
+                { user: safeUser(loggedInUser), accessToken },
                 "User logged in successfully",
                 "success"
             )
@@ -1168,16 +1143,20 @@ const refreshAccessToken = asyncHandler(async (req, res) => {
         );
 
     } catch (error) {
-        // Log error for debugging
-        logger.error('❌ Refresh token error:', error.message);
-        
+        // Log error for debugging with stack
+        logger.error('❌ Refresh token error:', {
+            message: error?.message,
+            name: error?.name,
+            stack: error?.stack,
+        });
+
         // If error is already an apiError, rethrow it
         if (error instanceof apiError) {
             throw error;
         }
-        
-        // Otherwise wrap in apiError
-        throw new apiError(401, error?.message || "Invalid refresh token");
+
+        // Otherwise wrap in apiError (500 for unexpected server errors)
+        throw new apiError(500, error?.message || "Refresh token processing failed");
     }
 });
 
@@ -1227,15 +1206,15 @@ const updateUserProfile = asyncHandler(async (req, res) => {
         }
 
         const existingUsername = await User.findOne({
-            username,
+            username: normalizeUsername(username),
             _id: { $ne: userId }
         });
 
         if (existingUsername) {
-            throw new apiError(400, "Username already taken");
+            throw new apiError(409, 'Username already exists');
         }
 
-        updates.username = username;
+        updates.username = normalizeUsername(username);
     }
 
     // Step 3: Email validation and provider-specific rules
@@ -1348,7 +1327,7 @@ const updateUserProfile = asyncHandler(async (req, res) => {
         });
 
         await updatedUser.save();
-        updatedUser = await User.findById(userId).select('-password -profilePicturePublicId');
+        updatedUser = await User.findById(userId).select(SAFE_USER_SELECT);
     } catch (error) {
         if (isDuplicateKeyError(error)) {
             throwDuplicateFieldError(error);
@@ -1390,7 +1369,7 @@ const updateUserProfile = asyncHandler(async (req, res) => {
     return res.status(200).json(
             new apiResponse(
                 200,
-                updatedUser,
+                safeUser(updatedUser),
                 OTP_RESPONSE_MESSAGES.genericPending
             )
     );
@@ -1400,11 +1379,17 @@ const updateUserProfile = asyncHandler(async (req, res) => {
 const updateProfilePicture = asyncHandler(async (req, res) => {
     const userId = req.user?._id;
     const profilePictureLocalPath = req.file?.path;
+    const profilePictureFile = req.file?.processedBuffer ? {
+        buffer: req.file.processedBuffer,
+        mimetype: req.file.processedMimetype,
+        secureFilename: req.file.secureFilename,
+        originalname: req.file.originalname,
+    } : null;
 
-    if (!profilePictureLocalPath) {
+    if (!profilePictureLocalPath && !profilePictureFile) {
         throw new apiError(400, "Profile picture is required");
     }
-    logger.log('📁 Profile picture local path:', profilePictureLocalPath);
+    logger.log('📁 Profile picture input detected');
 
     // --------------------------------------------------
     // STEP 1: Get current user to check if old picture exists
@@ -1430,8 +1415,10 @@ const updateProfilePicture = asyncHandler(async (req, res) => {
     // --------------------------------------------------
     // STEP 3: Upload new profile picture to Cloudinary
     // --------------------------------------------------
-    logger.log('📤 Uploading profile picture to Cloudinary', { file: profilePictureLocalPath });
-    const profilePicture = await uploadOnCloudinary(profilePictureLocalPath);
+    logger.log('📤 Uploading profile picture to Cloudinary');
+    const profilePicture = profilePictureFile
+        ? await uploadOnCloudinary(profilePictureFile)
+        : await uploadOnCloudinary(profilePictureLocalPath);
     logger.log('📤 Cloudinary upload result', { url: profilePicture?.url, public_id: profilePicture?.public_id });
 
     if (!profilePicture?.url) {
@@ -1445,7 +1432,7 @@ const updateProfilePicture = asyncHandler(async (req, res) => {
         userId,
         { $set: { profilePicture: profilePicture.url, profilePicturePublicId: profilePicture.public_id || null } },
         { new: true }
-    ).select("-password -refreshToken -profilePicturePublicId");
+    ).select(SAFE_USER_SELECT);
 
     // --------------------------------------------------
     // STEP 5: Success response
@@ -1453,7 +1440,7 @@ const updateProfilePicture = asyncHandler(async (req, res) => {
     return res.status(200).json(
         new apiResponse(
             200,
-            { user },
+            { user: safeUser(user) },
             "Profile picture updated successfully"
         )
     );
@@ -1681,11 +1668,6 @@ const resetPassword = asyncHandler(async (req, res) => {
         throw new apiError(400, emailError);
     }
 
-    // Block explicitly banned addresses for availability checks
-    if (isBannedEmail(normalizedEmail)) {
-        throw new apiError(400, 'This email address is not allowed for security reasons');
-    }
-
     // Block explicitly banned addresses
     if (isBannedEmail(normalizedEmail)) {
         throw new apiError(400, 'This email address is not allowed for security reasons');
@@ -1718,105 +1700,59 @@ const resetPassword = asyncHandler(async (req, res) => {
         throw new apiError(400, 'Password reset is not allowed for this account');
     }
 
-    // Check if OTP exists
-    if (!user.resetPasswordOTP || !user.resetPasswordOTPExpiry) {
-        return res.status(200).json({
-            success: false,
-            status: 'error',
-            message: 'No password reset request found. Please request a new OTP.',
-            data: null,
-        });
-    }
+    // Atomic consume: match hashed OTP and expiry on the user document and clear it in the same operation
+    const hashedOTP = hashOTP(otpString);
+    const now = new Date();
 
-    if (isBlockActive(user.resetPasswordBlockedUntil)) {
-        const minutesRemaining = getBlockedMinutesRemaining(user.resetPasswordBlockedUntil);
-        return res.status(200).json({
-            success: false,
-            status: 'rate_limited',
-            message: `Too many invalid OTP attempts. Please try again after ${minutesRemaining} minute${minutesRemaining > 1 ? 's' : ''}.`,
-            data: { attemptsRemaining: 0 },
-        });
-    }
-
-    // Check OTP expiry
-    if (new Date() > user.resetPasswordOTPExpiry) {
-        user.resetPasswordOTP = null;
-        user.resetPasswordOTPExpiry = null;
-        user.resetPasswordAttempts = 0;
-        user.resetPasswordBlockedUntil = null;
-        await user.save({ validateBeforeSave: false });
-
-        return res.status(200).json({
-            success: false,
-            status: 'error',
-            message: 'OTP has expired. Please request a new OTP.',
-            data: null,
-        });
-    }
-
-    // Check max attempts
-    if ((user.resetPasswordAttempts || 0) >= MAX_RESET_PASSWORD_OTP_ATTEMPTS) {
-        user.resetPasswordBlockedUntil = getValidationBlockedUntil();
-        await user.save({ validateBeforeSave: false });
-        return res.status(200).json({
-            success: false,
-            status: 'rate_limited',
-            message: `Maximum password reset attempts exceeded. Please try again after ${OTP_VALIDATION_BLOCK_MINUTES} minutes.`,
-            data: {
-                attemptsRemaining: 0,
+    const matched = await User.findOneAndUpdate(
+        {
+            email: normalizedEmail,
+            resetPasswordOTP: hashedOTP,
+            resetPasswordOTPExpiry: { $gt: now },
+        },
+        {
+            $set: {
+                resetPasswordOTP: null,
+                resetPasswordOTPExpiry: null,
+                resetPasswordAttempts: 0,
+                resetPasswordBlockedUntil: null,
             },
-        });
-    }
+        },
+        { new: false }
+    );
 
-    // Compare OTP
-    const isOTPValid = compareOTP(otpString, user.resetPasswordOTP);
-
-    if (!isOTPValid) {
-        user.resetPasswordAttempts = (user.resetPasswordAttempts || 0) + 1;
-
-        const remainingAttempts = Math.max(0, MAX_RESET_PASSWORD_OTP_ATTEMPTS - user.resetPasswordAttempts);
-        if (remainingAttempts <= 0) {
-            user.resetPasswordBlockedUntil = getValidationBlockedUntil();
-            await user.save({ validateBeforeSave: false });
-            return res.status(200).json({
-                success: false,
-                status: 'rate_limited',
-                message: `Maximum password reset attempts exceeded. Please try again after ${OTP_VALIDATION_BLOCK_MINUTES} minutes.`,
-                data: {
-                    attemptsRemaining: 0,
-                },
-            });
+    if (!matched) {
+        // No atomic match: determine reason without leaking OTPs
+        const fresh = await User.findOne({ email: normalizedEmail });
+        if (!fresh || !fresh.resetPasswordOTP || !fresh.resetPasswordOTPExpiry) {
+            return res.status(200).json({ success: false, status: 'error', message: 'No password reset request found. Please request a new OTP.', data: null });
         }
 
-        await user.save({ validateBeforeSave: false });
-        return res.status(200).json({
-            success: false,
-            status: 'error',
-            message: `Invalid OTP. You have ${remainingAttempts} attempt${remainingAttempts > 1 ? 's' : ''} remaining.`,
-            data: {
-                attemptsRemaining: remainingAttempts,
-            },
-        });
+        if (isBlockActive(fresh.resetPasswordBlockedUntil)) {
+            const minutesRemaining = getBlockedMinutesRemaining(fresh.resetPasswordBlockedUntil);
+            return res.status(200).json({ success: false, status: 'rate_limited', message: `Too many invalid OTP attempts. Please try again after ${minutesRemaining} minute${minutesRemaining > 1 ? 's' : ''}.`, data: { attemptsRemaining: 0 } });
+        }
+
+        if (new Date() > fresh.resetPasswordOTPExpiry) {
+            await User.findByIdAndUpdate(fresh._id, { $set: { resetPasswordOTP: null, resetPasswordOTPExpiry: null, resetPasswordAttempts: 0, resetPasswordBlockedUntil: null } });
+            return res.status(200).json({ success: false, status: 'error', message: 'OTP has expired. Please request a new OTP.', data: null });
+        }
+
+        // Increment attempts
+        const updated = await User.findByIdAndUpdate(fresh._id, { $inc: { resetPasswordAttempts: 1 } }, { new: true });
+        const remainingAttempts = Math.max(0, MAX_RESET_PASSWORD_OTP_ATTEMPTS - (updated.resetPasswordAttempts || 0));
+        if (remainingAttempts <= 0) {
+            await User.findByIdAndUpdate(fresh._id, { $set: { resetPasswordBlockedUntil: getValidationBlockedUntil() } });
+            return res.status(200).json({ success: false, status: 'rate_limited', message: `Maximum password reset attempts exceeded. Please try again after ${OTP_VALIDATION_BLOCK_MINUTES} minutes.`, data: { attemptsRemaining: 0 } });
+        }
+
+        return res.status(200).json({ success: false, status: 'error', message: `Invalid OTP. You have ${remainingAttempts} attempt${remainingAttempts > 1 ? 's' : ''} remaining.`, data: { attemptsRemaining: remainingAttempts } });
     }
 
-    // Update password
-    user.password = newPasswordString;
-    user.resetPasswordOTP = null;
-    user.resetPasswordOTPExpiry = null;
-    user.resetPasswordAttempts = 0;
-    user.resetPasswordBlockedUntil = null;
-    user.resetPasswordOtpResendAttempts = 0;
-    user.resetPasswordOtpResendBlockedUntil = null;
+    // Matched: proceed to update password using the matched document
+    await User.findByIdAndUpdate(matched._id, { $set: { password: newPasswordString, resetPasswordOTP: null, resetPasswordOTPExpiry: null, resetPasswordAttempts: 0, resetPasswordBlockedUntil: null, resetPasswordOtpResendAttempts: 0, resetPasswordOtpResendBlockedUntil: null } });
 
-    await user.save();
-
-    return res.status(200).json(
-        new apiResponse(
-            200,
-            null,
-            'Password reset successfully. Please log in with your new password.'
-        )
-    );
+    return res.status(200).json(new apiResponse(200, null, 'Password reset successfully. Please log in with your new password.'));
 });
 
 // ===================================================
@@ -2135,7 +2071,7 @@ const resendOTP = asyncHandler(async (req, res) => {
 
 const getCurrentUser = asyncHandler(async (req, res) => {
     return res.status(200).json(
-        new apiResponse(200, req.user, "Current user fetched successfully")
+        new apiResponse(200, safeUser(req.user), "Current user fetched successfully")
     );
 });
 
@@ -2166,8 +2102,6 @@ const googleAuthCallback = asyncHandler(async (req, res) => {
         });
 
         logger.log(`✅ Tokens generated and cookies set for Google OAuth user: ${user.email}`);
-        logger.log(`   Access Token: ${accessToken.substring(0, 20)}...`);
-        logger.log(`   Refresh Token: ${refreshToken.substring(0, 20)}...`);
 
         // Redirect to OAuth callback bridge so frontend can finalize auth before route guards run.
         const redirectUrl = `${getFrontendOrigin()}/oauth/callback`;
@@ -2218,11 +2152,11 @@ const checkEmailExists = asyncHandler(async (req, res) => {
 const checkUsernameExists = asyncHandler(async (req, res) => {
     const { username } = req.body;
 
-    if (!username || typeof username !== 'string' || !username.trim()) {
-        throw new apiError(400, 'Username is required');
+    if (getUsernameValidationError(username)) {
+        throw new apiError(400, 'Invalid username');
     }
 
-    const normalizedUsername = username.trim().toLowerCase();
+    const normalizedUsername = normalizeUsername(username);
 
     const usernameError = getUsernameValidationError(normalizedUsername);
     if (usernameError) {
@@ -2266,180 +2200,115 @@ const verifyEmailOTP = asyncHandler(async (req, res) => {
         throw new apiError(400, emailError);
     }
 
-    // Find pending registration
-    const pendingRegistration = await PendingRegistration.findOne({ email: normalizedEmail });
+    // For single-use and atomic verification we match the hashed OTP directly
+    const hashedOTP = hashOTP(otpString);
 
+    // Try to atomically consume the OTP and clear it if matched and not expired
+    const now = new Date();
+    const pending = await PendingRegistration.findOneAndUpdate(
+        {
+            email: normalizedEmail,
+            emailVerificationOTP: hashedOTP,
+            emailVerificationOTPExpiry: { $gt: now },
+        },
+        {
+            $set: {
+                emailVerificationOTP: null,
+                emailVerificationOTPExpiry: null,
+                emailVerificationAttempts: 0,
+                emailVerificationBlockedUntil: null,
+            },
+        },
+        { new: false }
+    );
+
+    // If we successfully consumed the OTP, proceed to create the user atomically from the pending doc
+    if (pending) {
+        // Check for existing user collisions (race-safe)
+        const existingUser = await User.findOne({
+            $or: [
+                { email: normalizedEmail },
+                { username: pending.username },
+            ],
+        });
+
+        if (existingUser) {
+            // Remove the pending record and respond safely
+            await PendingRegistration.findByIdAndDelete(pending._id);
+            if (existingUser.email === normalizedEmail) {
+                return res.status(200).json({ success: false, status: 'error', message: 'Email already registered. Please login.', data: null });
+            }
+
+            return res.status(200).json({ success: false, status: 'error', message: 'Username already exists', data: null });
+        }
+
+        let createdUser;
+        try {
+            createdUser = await User.create({
+                fullName: pending.fullName,
+                username: pending.username,
+                email: pending.email,
+                password: pending.password,
+                authProvider: 'local',
+                authProviders: ['local'],
+                isVerified: true,
+            });
+        } catch (error) {
+            if (isDuplicateKeyError(error)) {
+                await PendingRegistration.findByIdAndDelete(pending._id);
+                throwDuplicateFieldError(error, normalizedEmail, pending.username);
+            }
+
+            throw error;
+        }
+
+        await PendingRegistration.findByIdAndDelete(pending._id);
+
+        logger.log(`✅ Email verified and user created: ${createdUser.email}`);
+
+        return res.status(200).json(new apiResponse(200, {
+            email: createdUser.email,
+            isVerified: true,
+            user: { _id: createdUser._id, fullName: createdUser.fullName, username: createdUser.username, email: createdUser.email },
+        }, 'Email verified successfully. Your account has been created.'));
+    }
+
+    // If atomic consume failed, provide safe error handling and increment attempts where appropriate
+    const pendingRegistration = await PendingRegistration.findOne({ email: normalizedEmail });
     if (!pendingRegistration) {
         const existingUser = await User.findOne({ email: normalizedEmail });
         if (existingUser) {
-            return res.status(200).json({
-                success: false,
-                status: 'error',
-                message: 'Email already registered. Please login.',
-                data: null,
-            });
+            return res.status(200).json({ success: false, status: 'error', message: 'Email already registered. Please login.', data: null });
         }
 
-        return res.status(200).json({
-            success: false,
-            status: 'error',
-            message: 'No pending registration found for this email. Please sign up again.',
-            data: null,
-        });
+        return res.status(200).json({ success: false, status: 'error', message: 'No pending registration found for this email. Please sign up again.', data: null });
     }
 
-    // Check if OTP exists
-    if (!pendingRegistration.emailVerificationOTP || !pendingRegistration.emailVerificationOTPExpiry) {
+    // If OTP missing or expired, remove pending and respond generically
+    if (!pendingRegistration.emailVerificationOTP || !pendingRegistration.emailVerificationOTPExpiry || new Date() > pendingRegistration.emailVerificationOTPExpiry) {
         await PendingRegistration.findByIdAndDelete(pendingRegistration._id);
-        return res.status(200).json({
-            success: false,
-            status: 'error',
-            message: 'No OTP found. Please sign up again.',
-            data: null,
-        });
-    }
-
-    // Check OTP expiry
-    if (new Date() > pendingRegistration.emailVerificationOTPExpiry) {
-        await PendingRegistration.findByIdAndDelete(pendingRegistration._id);
-
-        return res.status(200).json({
-            success: false,
-            status: 'error',
-            message: 'OTP has expired. Please request a new OTP.',
-            data: null,
-        });
+        return res.status(200).json({ success: false, status: 'error', message: 'OTP has expired or is invalid. Please request a new OTP.', data: null });
     }
 
     if (isBlockActive(pendingRegistration.emailVerificationBlockedUntil)) {
         const minutesRemaining = getBlockedMinutesRemaining(pendingRegistration.emailVerificationBlockedUntil);
-        return res.status(200).json({
-            success: false,
-            status: 'rate_limited',
-            message: `Too many invalid OTP attempts. Please try again after ${minutesRemaining} minute${minutesRemaining > 1 ? 's' : ''}.`,
-            data: {
-                attemptsRemaining: 0,
-            },
-        });
+        return res.status(200).json({ success: false, status: 'rate_limited', message: `Too many invalid OTP attempts. Please try again after ${minutesRemaining} minute${minutesRemaining > 1 ? 's' : ''}.`, data: { attemptsRemaining: 0 } });
     }
 
-    // Check max attempts
-    if ((pendingRegistration.emailVerificationAttempts || 0) >= MAX_SIGNUP_OTP_ATTEMPTS) {
-        pendingRegistration.emailVerificationBlockedUntil = getValidationBlockedUntil();
-        await pendingRegistration.save({ validateBeforeSave: false });
-
-        return res.status(200).json({
-            success: false,
-            status: 'rate_limited',
-            message: `Too many invalid OTP attempts. Please try again after ${OTP_VALIDATION_BLOCK_MINUTES} minutes.`,
-            data: {
-                attemptsRemaining: 0,
-            },
-        });
-    }
-
-    // Compare OTP
-    const isOTPValid = compareOTP(otpString, pendingRegistration.emailVerificationOTP);
-
-    if (!isOTPValid) {
-        pendingRegistration.emailVerificationAttempts += 1;
-
-        const remainingAttempts = Math.max(0, MAX_SIGNUP_OTP_ATTEMPTS - pendingRegistration.emailVerificationAttempts);
-        if (remainingAttempts <= 0) {
-            pendingRegistration.emailVerificationBlockedUntil = getValidationBlockedUntil();
-            await pendingRegistration.save({ validateBeforeSave: false });
-
-            return res.status(200).json({
-                success: false,
-                status: 'rate_limited',
-                message: `Maximum verification attempts exceeded. Please try again after ${OTP_VALIDATION_BLOCK_MINUTES} minutes.`,
-                data: {
-                    attemptsRemaining: 0,
-                },
-            });
-        }
-
-        await pendingRegistration.save({ validateBeforeSave: false });
-        return res.status(200).json({
-            success: false,
-            status: 'error',
-            message: `Invalid OTP. ${remainingAttempts} attempt${remainingAttempts > 1 ? 's' : ''} remaining.`,
-            data: {
-                attemptsRemaining: remainingAttempts,
-            },
-        });
-    }
-
-    pendingRegistration.emailVerificationAttempts = 0;
-    pendingRegistration.emailVerificationBlockedUntil = null;
-
-    const existingUser = await User.findOne({
-        $or: [
-            { email: normalizedEmail },
-            { username: pendingRegistration.username },
-        ],
-    });
-
-    if (existingUser) {
-        await PendingRegistration.findByIdAndDelete(pendingRegistration._id);
-
-        if (existingUser.email === normalizedEmail) {
-            return res.status(200).json({
-                success: false,
-                status: 'error',
-                message: 'Email already registered. Please login.',
-                data: null,
-            });
-        }
-
-        return res.status(200).json({
-            success: false,
-            status: 'error',
-            message: 'This username is already taken. Please choose a different username.',
-            data: null,
-        });
-    }
-
-    let createdUser;
-    try {
-        createdUser = await User.create({
-            fullName: pendingRegistration.fullName,
-            username: pendingRegistration.username,
-            email: pendingRegistration.email,
-            password: pendingRegistration.password,
-            authProvider: 'local',
-            authProviders: ['local'],
-            isVerified: true,
-        });
-    } catch (error) {
-        if (isDuplicateKeyError(error)) {
-            await PendingRegistration.findByIdAndDelete(pendingRegistration._id);
-            throwDuplicateFieldError(error, normalizedEmail, pendingRegistration.username);
-        }
-
-        throw error;
-    }
-
-    await PendingRegistration.findByIdAndDelete(pendingRegistration._id);
-
-    logger.log(`✅ Email verified and user created: ${createdUser.email}`);
-
-    return res.status(200).json(
-        new apiResponse(
-            200,
-            {
-                email: createdUser.email,
-                isVerified: true,
-                user: {
-                    _id: createdUser._id,
-                    fullName: createdUser.fullName,
-                    username: createdUser.username,
-                    email: createdUser.email,
-                },
-            },
-            'Email verified successfully. Your account has been created.'
-        )
+    // Increment attempts atomically and enforce blocking if exceeded
+    const updated = await PendingRegistration.findByIdAndUpdate(
+        pendingRegistration._id,
+        { $inc: { emailVerificationAttempts: 1 } },
+        { new: true }
     );
+
+    const remainingAttempts = Math.max(0, MAX_SIGNUP_OTP_ATTEMPTS - (updated.emailVerificationAttempts || 0));
+    if (remainingAttempts <= 0) {
+        await PendingRegistration.findByIdAndUpdate(pendingRegistration._id, { $set: { emailVerificationBlockedUntil: getValidationBlockedUntil() } });
+        return res.status(200).json({ success: false, status: 'rate_limited', message: `Maximum verification attempts exceeded. Please try again after ${OTP_VALIDATION_BLOCK_MINUTES} minutes.`, data: { attemptsRemaining: 0 } });
+    }
+
+    return res.status(200).json({ success: false, status: 'error', message: `Invalid OTP. ${remainingAttempts} attempt${remainingAttempts > 1 ? 's' : ''} remaining.`, data: { attemptsRemaining: remainingAttempts } });
 });
 
 /**
@@ -2475,85 +2344,54 @@ const verifyEmailChange = asyncHandler(async (req, res) => {
     }
 
     if (!user.emailOtp || !user.emailOtpExpiry) {
-        return res.status(200).json({
-            success: false,
-            status: 'error',
-            message: 'OTP expired',
-            data: null,
-        });
+        return res.status(200).json({ success: false, status: 'error', message: 'OTP expired', data: null });
     }
 
-    if (isBlockActive(user.emailVerificationBlockedUntil)) {
-        const minutesRemaining = getBlockedMinutesRemaining(user.emailVerificationBlockedUntil);
-        return res.status(200).json({
-            success: false,
-            status: 'rate_limited',
-            message: `Too many invalid OTP attempts. Please try again after ${minutesRemaining} minute${minutesRemaining > 1 ? 's' : ''}.`,
-            data: { attemptsRemaining: 0 },
-        });
-    }
+    // Atomic consume of email change OTP
+    const hashedOTP = hashOTP(String(otp).trim());
+    const now = new Date();
 
-    // Check OTP expiry
-    if (new Date() > user.emailOtpExpiry) {
-        user.pendingEmail = null;
-        user.emailOtp = null;
-        user.emailOtpExpiry = null;
-        user.emailOtpResendAvailableAt = null;
-        user.emailVerificationAttempts = 0;
-        user.emailVerificationBlockedUntil = null;
-        await user.save({ validateBeforeSave: false });
+    const matchedUser = await User.findOneAndUpdate(
+        { _id: user._id, emailOtp: hashedOTP, emailOtpExpiry: { $gt: now } },
+        {
+            $set: {
+                emailOtp: null,
+                emailOtpExpiry: null,
+                emailVerificationAttempts: 0,
+                emailVerificationBlockedUntil: null,
+            },
+        },
+        { new: false }
+    );
 
-        return res.status(200).json({
-            success: false,
-            status: 'error',
-            message: 'OTP expired',
-            data: null,
-        });
-    }
-
-    // Check max attempts
-    if (user.emailVerificationAttempts >= MAX_EMAIL_CHANGE_OTP_ATTEMPTS) {
-        user.emailVerificationBlockedUntil = getValidationBlockedUntil();
-        await user.save({ validateBeforeSave: false });
-
-        return res.status(200).json({
-            success: false,
-            status: 'rate_limited',
-            message: `Too many invalid OTP attempts. Please try again after ${OTP_VALIDATION_BLOCK_MINUTES} minutes.`,
-            data: { attemptsRemaining: 0 },
-        });
-    }
-
-    const isOTPValid = compareOTP(String(otp).trim(), user.emailOtp);
-
-    if (!isOTPValid) {
-        user.emailVerificationAttempts = (user.emailVerificationAttempts || 0) + 1;
-        const remaining = MAX_EMAIL_CHANGE_OTP_ATTEMPTS - user.emailVerificationAttempts;
-
-        if (remaining <= 0) {
-            user.emailVerificationBlockedUntil = getValidationBlockedUntil();
-            await user.save({ validateBeforeSave: false });
-
-            return res.status(200).json({
-                success: false,
-                status: 'rate_limited',
-                message: `Maximum verification attempts exceeded. Please try again after ${OTP_VALIDATION_BLOCK_MINUTES} minutes.`,
-                data: { attemptsRemaining: 0 },
-            });
+    if (!matchedUser) {
+        const fresh = await User.findById(user._id);
+        if (!fresh || !fresh.emailOtp || !fresh.emailOtpExpiry) {
+            // Clear pending fields if expired
+            if (fresh) {
+                await User.findByIdAndUpdate(fresh._id, { $set: { pendingEmail: null, emailOtp: null, emailOtpExpiry: null, emailOtpResendAvailableAt: null, emailVerificationAttempts: 0, emailVerificationBlockedUntil: null } });
+            }
+            return res.status(200).json({ success: false, status: 'error', message: 'OTP expired', data: null });
         }
 
-        await user.save({ validateBeforeSave: false });
+        if (isBlockActive(fresh.emailVerificationBlockedUntil)) {
+            const minutesRemaining = getBlockedMinutesRemaining(fresh.emailVerificationBlockedUntil);
+            return res.status(200).json({ success: false, status: 'rate_limited', message: `Too many invalid OTP attempts. Please try again after ${minutesRemaining} minute${minutesRemaining > 1 ? 's' : ''}.`, data: { attemptsRemaining: 0 } });
+        }
 
-        return res.status(200).json({
-            success: false,
-            status: 'error',
-            message: `Invalid OTP. ${remaining} attempts remaining.`,
-            data: { attemptsRemaining: remaining },
-        });
+        // Increment attempts
+        const updated = await User.findByIdAndUpdate(fresh._id, { $inc: { emailVerificationAttempts: 1 } }, { new: true });
+        const remaining = Math.max(0, MAX_EMAIL_CHANGE_OTP_ATTEMPTS - (updated.emailVerificationAttempts || 0));
+        if (remaining <= 0) {
+            await User.findByIdAndUpdate(fresh._id, { $set: { emailVerificationBlockedUntil: getValidationBlockedUntil() } });
+            return res.status(200).json({ success: false, status: 'rate_limited', message: `Too many invalid OTP attempts. Please try again after ${OTP_VALIDATION_BLOCK_MINUTES} minutes.`, data: { attemptsRemaining: 0 } });
+        }
+
+        return res.status(200).json({ success: false, status: 'error', message: `Invalid OTP. ${remaining} attempts remaining.`, data: { attemptsRemaining: remaining } });
     }
 
     // OTP valid — finalize email change
-    const newEmail = user.pendingEmail;
+    const newEmail = matchedUser.pendingEmail;
 
     // Ensure newEmail isn't used by another account (race check)
     const existingEmail = await User.findOne({ email: newEmail, _id: { $ne: user._id } });

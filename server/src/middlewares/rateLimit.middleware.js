@@ -16,7 +16,7 @@ const createRateLimiter = (windowMinutes, maxRequests, message) => {
         standardHeaders: true,
         legacyHeaders: false,
         handler: (req, res, next, options) => {
-            res.status(200).json(options.message);
+            res.status(429).json(options.message);
         },
     });
 };

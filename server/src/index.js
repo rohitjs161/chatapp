@@ -10,9 +10,7 @@ import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
 import { setSocketServer } from "./socket/io.js";
 import { logger } from "./utils/logger.js";
-import {
-    REQUEST_PENDING_SENDER_LIMIT,
-} from "./utils/conversationRequest.js";
+import { reservePendingMessageSlot } from "./utils/requestReservation.js";
 
 const emitConversationUnreadCountToUsers = (conversationId, participants, unreadCounters = {}) => {
     const participantIds = Array.isArray(participants)
@@ -815,7 +813,6 @@ io.on("connection", (socket) => {
 
             if (effectiveStatus === "pending") {
                 const initiatorId = requestConversation.initiator ? String(requestConversation.initiator) : "";
-                const pendingMessageCount = Number(requestConversation.pendingMessageCount || 0);
 
                 if (initiatorId && String(sender) !== initiatorId) {
                     socket.emit("message-failed", {
@@ -852,12 +849,25 @@ io.on("connection", (socket) => {
                     return;
                 }
 
-                if (pendingMessageCount >= REQUEST_PENDING_SENDER_LIMIT) {
+                // Atomically reserve a pending-message slot to prevent race conditions
+                try {
+                    await reservePendingMessageSlot(trimmedConversationId, sender, Conversation);
+                } catch (err) {
+                    if (err?.statusCode === 403) {
+                        socket.emit("message-failed", {
+                            message: "Message request limit reached",
+                            code: "REQUEST_PENDING_LIMIT",
+                        });
+                        replyAck(ack, { success: false, code: "REQUEST_PENDING_LIMIT", message: "Message request limit reached" });
+                        return;
+                    }
+
+                    logger.error("❌ Error reserving request slot:", err?.message || err);
                     socket.emit("message-failed", {
-                        message: "Wait for user to accept request",
-                        code: "REQUEST_PENDING_LIMIT",
+                        message: "Failed to reserve request slot",
+                        code: "REQUEST_RESERVATION_ERROR",
                     });
-                    replyAck(ack, { success: false, code: "REQUEST_PENDING_LIMIT", message: "Wait for user to accept request" });
+                    replyAck(ack, { success: false, code: "REQUEST_RESERVATION_ERROR", message: "Failed to reserve request slot" });
                     return;
                 }
             } else if (!sanitizedContent && !safeMediaUrl) {
@@ -897,17 +907,9 @@ io.on("connection", (socket) => {
                 .lean();
 
             if (conversationParticipants?.status === "pending") {
-                const updatedRequestConversation = await Conversation.findByIdAndUpdate(
-                    trimmedConversationId,
-                    { $inc: { pendingMessageCount: 1 } },
-                    { new: true }
-                )
-                    .select("participants initiator pendingMessageCount expiresAt status")
-                    .lean();
-
-                const initiatorId = String(updatedRequestConversation?.initiator || "");
-                const receiverId = Array.isArray(updatedRequestConversation?.participants)
-                    ? updatedRequestConversation.participants
+                const initiatorId = String(conversationParticipants?.initiator || "");
+                const receiverId = Array.isArray(conversationParticipants?.participants)
+                    ? conversationParticipants.participants
                         .map((participant) => String(participant?._id || participant))
                         .find((participantId) => participantId && participantId !== initiatorId)
                     : null;
@@ -916,9 +918,9 @@ io.on("connection", (socket) => {
                     io.to(`user:${receiverId}`).emit("new_message_request", {
                         conversationId: trimmedConversationId,
                         status: "pending",
-                        pendingMessageCount: Number(updatedRequestConversation?.pendingMessageCount || 0),
+                        pendingMessageCount: Number(conversationParticipants?.pendingMessageCount || 0),
                         initiator: initiatorId,
-                        expiresAt: updatedRequestConversation?.expiresAt || null,
+                        expiresAt: conversationParticipants?.expiresAt || null,
                     });
                 }
             }

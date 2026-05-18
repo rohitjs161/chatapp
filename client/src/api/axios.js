@@ -1,6 +1,7 @@
 import axios from "axios";
 import { disconnectSocket, updateSocketToken } from "../socket/socket.js";
 import { logger } from "../utils/logger.js";
+import { clearAccessToken, getAccessToken, setAccessToken } from "../store/authToken.js";
 
 const getBaseUrl = () => {
     const url = import.meta.env.VITE_API_URL;
@@ -39,7 +40,7 @@ const refreshAccessToken = async () => {
             throw new Error("Access token missing in refresh response");
         }
 
-        localStorage.setItem("accessToken", accessToken);
+        setAccessToken(accessToken);
         updateSocketToken(accessToken);
 
         logger.log("Access token refreshed successfully");
@@ -55,7 +56,7 @@ axiosInstance.interceptors.request.use(
     (config) => {
         config.withCredentials = true;
 
-        const token = localStorage.getItem("accessToken");
+        const token = getAccessToken();
         if (token) {
             config.headers.Authorization = `Bearer ${token}`;
         }
@@ -98,9 +99,9 @@ axiosInstance.interceptors.response.use(
             } catch (refreshError) {
                 logger.error("Token refresh failed, redirecting to login");
 
-                localStorage.removeItem("accessToken");
                 localStorage.removeItem("refreshToken");
                 localStorage.removeItem("user");
+                clearAccessToken();
                 disconnectSocket();
 
                 window.location.href = "/login";

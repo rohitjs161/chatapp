@@ -9,10 +9,9 @@ import { emitToUserRoom, getSocketServer } from "../socket/io.js";
 import { logger } from "../utils/logger.js";
 import {
     expireConversationIfNeeded,
-    getRequestExpiryDate,
     getRequestReceiverId,
-    REQUEST_PENDING_SENDER_LIMIT,
 } from "../utils/conversationRequest.js";
+import { reservePendingMessageSlot } from "../utils/requestReservation.js";
 
 // --------------------------------------------------
 // HELPERS
@@ -195,17 +194,15 @@ const sendMessage = asyncHandler(async (req, res) => {
     }
 
     const mediaLocalPath = req.file?.path;
+    const mediaFile = req.file?.processedBuffer ? {
+        buffer: req.file.processedBuffer,
+        mimetype: req.file.processedMimetype,
+        secureFilename: req.file.secureFilename,
+        originalname: req.file.originalname,
+    } : null;
     const trimmedContent = content?.trim() || "";
-    const pendingMessageCount = Number(activeConversation.pendingMessageCount || 0);
 
-    if (!activeConversation.initiator) {
-        activeConversation.initiator = senderId;
-        activeConversation.status = "pending";
-        activeConversation.pendingMessageCount = pendingMessageCount;
-        activeConversation.expiresAt = getRequestExpiryDate();
-        await activeConversation.save();
-    }
-
+    // If conversation is not accepted, perform strict server-side checks.
     if (activeConversation.status !== "accepted") {
         if (activeConversation.status === "rejected") {
             throw new apiError(400, "Chat request was rejected. Send again.");
@@ -232,8 +229,14 @@ const sendMessage = asyncHandler(async (req, res) => {
             throw new apiError(403, "Only text messages are allowed before acceptance");
         }
 
-        if (pendingMessageCount >= REQUEST_PENDING_SENDER_LIMIT) {
-            throw new apiError(403, "Wait for user to accept request");
+        // Reserve a pending-message slot (atomic) — throws apiError(403) if limit reached
+        const reservedConversation = await reservePendingMessageSlot(activeConversation._id, senderId);
+
+        // Update activeConversation reference to reflect reservation
+        if (reservedConversation) {
+            activeConversation.pendingMessageCount = Number(reservedConversation.pendingMessageCount || 0);
+            activeConversation.initiator = reservedConversation.initiator;
+            activeConversation.expiresAt = reservedConversation.expiresAt;
         }
     }
 
@@ -242,10 +245,16 @@ const sendMessage = asyncHandler(async (req, res) => {
     // --------------------------------------------------
     let mediaUrl = null;
 
-    if (mediaLocalPath) {
+    if (mediaFile) {
+        const uploadedMedia = await uploadOnCloudinary(mediaFile);
+        if (!uploadedMedia?.url) {
+            throw new apiError(500, "Error uploading media to Cloudinary. Please try again.");
+        }
+        mediaUrl = uploadedMedia.url;
+        logger.log(`✅ Media uploaded to Cloudinary: ${mediaUrl}`);
+    } else if (mediaLocalPath) {
         const uploadedMedia = await uploadOnCloudinary(mediaLocalPath);
         if (!uploadedMedia?.url) {
-            // Local file is already deleted by uploadOnCloudinary function on error
             throw new apiError(500, "Error uploading media to Cloudinary. Please try again.");
         }
         mediaUrl = uploadedMedia.url;
@@ -279,9 +288,6 @@ const sendMessage = asyncHandler(async (req, res) => {
     });
 
     if (activeConversation.status === "pending") {
-        activeConversation.pendingMessageCount = pendingMessageCount + 1;
-        await activeConversation.save();
-
         const receiverId = getRequestReceiverId(activeConversation);
         if (receiverId) {
             emitToUserRoom(receiverId, "new_message_request", {

@@ -4,6 +4,37 @@ import { User } from '../models/user.model.js';
 import { apiError } from '../utils/apiError.js';
 import { logger } from "../utils/logger.js";
 
+const sanitizeGoogleUsernameBase = (value = '') => {
+    const normalized = String(value || '')
+        .normalize('NFKC')
+        .toLowerCase()
+        .replace(/[^a-z0-9._]/g, '')
+        .replace(/\.{2,}/g, '.')
+        .replace(/_{2,}/g, '_')
+        .replace(/^[._]+|[._]+$/g, '');
+
+    return normalized || 'user';
+};
+
+const generateUniqueGoogleUsername = async (email) => {
+    const base = sanitizeGoogleUsernameBase(String(email || '').split('@')[0]).slice(0, 12) || 'user';
+
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+        const suffix = attempt === 0
+            ? ''
+            : `${Date.now().toString(36).slice(-4)}${Math.random().toString(36).slice(2, 5)}`;
+
+        const candidate = `${base}${suffix}`.slice(0, 20).replace(/[._]+$/g, '') || 'user';
+        const existingUser = await User.findOne({ username: candidate });
+
+        if (!existingUser) {
+            return candidate;
+        }
+    }
+
+    return `${base}${Math.random().toString(36).slice(2, 8)}`.slice(0, 20).replace(/[._]+$/g, '') || 'user';
+};
+
 /**
  * Configure Passport with Google OAuth strategy
  * Handles user lookup/creation and linking existing accounts
@@ -71,10 +102,7 @@ const configurePassport = () => {
                     }
 
                     // User doesn't exist - create new user
-                    // Generate unique username from email + timestamp
-                    const emailPrefix = email.split('@')[0];
-                    const timestamp = Date.now().toString().slice(-6);
-                    const username = `${emailPrefix}${timestamp}`.toLowerCase().slice(0, 20);
+                    const username = await generateUniqueGoogleUsername(email);
 
 
                     const newUser = new User({

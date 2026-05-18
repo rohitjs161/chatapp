@@ -28,9 +28,11 @@ const parseAllowedOrigins = () => {
 
 const allowedOrigins = parseAllowedOrigins();
 
-logger.log("Allowed CORS origins:", allowedOrigins);
+if (process.env.NODE_ENV !== "production") {
+    logger.log("Allowed CORS origins:", allowedOrigins);
+}
 
-app.use(cors({
+const corsOptions = {
     origin: (origin, callback) => {
         // Allow requests with no origin — Postman, mobile, server-to-server
         if (!origin) {
@@ -62,10 +64,12 @@ app.use(cors({
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
     optionsSuccessStatus: 200,
-}));
+};
+
+app.use(cors(corsOptions));
 
 // Make sure preflight requests are answered before route handlers.
-app.options(/.*/, cors());
+app.options(/.*/, cors(corsOptions));
 
 // Force HTTPS redirect in production
 if (process.env.NODE_ENV === "production") {
@@ -119,6 +123,8 @@ app.use((req, res, next) => {
 
 // Global Error Handler
 app.use((error, req, res, next) => {
+    const isProduction = process.env.NODE_ENV === "production";
+    const isOperationalError = error instanceof apiError;
     let statusCode = error.statusCode || 500;
     let message = error.message || "Internal Server Error";
     let errors = error.errors || [];
@@ -150,7 +156,7 @@ app.use((error, req, res, next) => {
         message = "Invalid ID format";
     }
 
-    if (process.env.NODE_ENV === "development") {
+    if (!isProduction) {
         logger.error("ERROR:", {
             statusCode,
             message,
@@ -159,13 +165,29 @@ app.use((error, req, res, next) => {
         });
     }
 
+    if (isProduction && !isOperationalError) {
+        if (statusCode === 401) {
+            message = "Authentication failed";
+        } else if (statusCode === 403) {
+            message = "Access denied";
+        } else if (statusCode === 404) {
+            message = "Not found";
+        } else if (statusCode === 429) {
+            message = "Too many requests";
+        } else if (statusCode >= 500) {
+            message = "Something went wrong";
+        }
+
+        errors = [];
+    }
+
     res.status(statusCode).json({
         success: false,
         status: error.status || (statusCode === 429 ? "rate_limited" : "error"),
         statusCode,
         message,
         errors: errors.length > 0 ? errors : undefined,
-        ...(process.env.NODE_ENV === "development" && { stack: error.stack }),
+        ...(!isProduction && { stack: error.stack }),
     });
 });
 

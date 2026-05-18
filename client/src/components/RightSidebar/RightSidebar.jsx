@@ -5,7 +5,7 @@ import useOnlineUsers from '../../socket/useOnlineUsers.js'
 import useNotificationStore from '../../store/notification.store.js'
 import { logger } from '../../utils/logger.js'
 
-const RightSidebar = ({ selectedConversation }) => {
+const RightSidebar = ({ selectedConversation, onClose }) => {
   const [activeTab, setActiveTab] = useState('profile')
   const { user } = useAuthStore()
   const { isUserOnline } = useOnlineUsers()
@@ -133,12 +133,17 @@ const RightSidebar = ({ selectedConversation }) => {
   }, [sharedMedia])
 
   return (
-    <div className="hidden h-full min-w-0 w-full flex-col overflow-hidden bg-white lg:flex lg:flex-none">
+    <div className="flex h-full min-w-0 w-full flex-col overflow-hidden bg-white">
       <div className="border-b border-gray-200 bg-white px-4 py-3 sm:px-5 flex-shrink-0 min-w-0">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-3">
           <h2 className="text-lg font-semibold text-gray-800">Contact Info</h2>
-          <button className="p-2 hover:bg-gray-100 rounded-lg transition-colors" title="More options">
-            <span className="text-gray-600 text-lg">⋮</span>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-lg px-3 py-2 text-sm font-medium text-gray-600 transition-colors hover:bg-gray-100 hover:text-gray-900"
+            title="Close contact info"
+          >
+            Close
           </button>
         </div>
       </div>

@@ -1,6 +1,7 @@
 import {v2 as cloudinary} from "cloudinary";
 import fs from "fs"
 import path from "path"
+import crypto from "crypto";
 import { logger } from "./logger.js";
 
 cloudinary.config({ 
@@ -50,18 +51,19 @@ const extractCloudinaryAssetMeta = (fileUrl) => {
 
 // --------------------------------------------------
 // UPLOAD FILE TO CLOUDINARY
+// Accepts either a local file path (string) or an object { buffer, originalname, mimetype, secureFilename }
 // --------------------------------------------------
-const uploadOnCloudinary = async (localFilePath) => {
+const uploadOnCloudinary = async (input) => {
     try {
-        if (!localFilePath) return null;
+        if (!input) return null;
 
-        // Resolve relative paths to absolute to avoid ENOENT due to cwd differences
-        const resolvedPath = path.isAbsolute(localFilePath) ? localFilePath : path.resolve(process.cwd(), localFilePath);
-
-        if (!fs.existsSync(resolvedPath)) {
-            logger.error('❌ Cloudinary upload error: local file not found', resolvedPath);
-            return null;
-        }
+        // If input is a string path, keep previous behavior
+        if (typeof input === 'string') {
+            const resolvedPath = path.isAbsolute(input) ? input : path.resolve(process.cwd(), input);
+            if (!fs.existsSync(resolvedPath)) {
+                logger.error('❌ Cloudinary upload error: local file not found');
+                return null;
+            }
 
             const response = await cloudinary.uploader.upload(resolvedPath, {
                 resource_type: "auto",
@@ -77,22 +79,31 @@ const uploadOnCloudinary = async (localFilePath) => {
                 }
             }
 
-            // Normalize response for callers: provide `url` and `public_id`
             const url = response?.secure_url || response?.url || response?.secure_url_https || null;
             const public_id = response?.public_id || response?.publicId || null;
-
             return { ...response, url, public_id };
+        }
+
+        // Otherwise assume input is an object with buffer
+        const { buffer, mimetype, secureFilename, originalname } = input || {};
+        if (!buffer || !(buffer instanceof Buffer)) {
+            logger.error('❌ Cloudinary upload error: invalid buffer input');
+            return null;
+        }
+
+        const dataUri = `data:${mimetype || 'application/octet-stream'};base64,${buffer.toString('base64')}`;
+        const publicId = `uploads/${secureFilename || (crypto.randomBytes(12).toString('hex'))}-${Date.now()}`;
+
+        const response = await cloudinary.uploader.upload(dataUri, {
+            resource_type: "image",
+            public_id: publicId,
+        });
+
+        const url = response?.secure_url || response?.url || response?.secure_url_https || null;
+        const public_id = response?.public_id || response?.publicId || null;
+        return { ...response, url, public_id };
     } catch (error) {
         logger.error("❌ Cloudinary upload error:", error?.message || error);
-        // Delete local file in case of error
-        try {
-            const resolvedPath = path.isAbsolute(localFilePath) ? localFilePath : path.resolve(process.cwd(), localFilePath);
-            if (fs.existsSync(resolvedPath)) {
-                fs.unlinkSync(resolvedPath);
-            }
-        } catch (e) {
-            logger.warn('⚠️ Failed to remove local file after upload error', e?.message || e);
-        }
         return null;
     }
 };

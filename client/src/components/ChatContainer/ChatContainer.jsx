@@ -26,7 +26,7 @@ const getCalendarDayDiffFromToday = (dateValue) => {
   return Math.floor((todayStart - targetStart) / DAY_IN_MS)
 }
 
-const ChatContainer = () => {
+const ChatContainer = ({ onToggleRightSidebar }) => {
   const [message, setMessage] = useState('')
   const [showEmojiPicker, setShowEmojiPicker] = useState(false)
   const [activeMenuId, setActiveMenuId] = useState(null)
@@ -871,12 +871,22 @@ const ChatContainer = () => {
             )}
           </div>
         </div>
-        <div className="flex items-center gap-1 sm:gap-2"></div>
+        <div className="flex items-center gap-1 sm:gap-2">
+          <button
+            type="button"
+            onClick={onToggleRightSidebar}
+            className="p-2 rounded-lg hover:bg-gray-100 transition-colors text-gray-600 hover:text-gray-800"
+            title="View contact info"
+            aria-label="View contact info"
+          >
+            <span className="text-xl">⋮</span>
+          </button>
+        </div>
       </div>
 
       {/* Messages */}
       {selectedConversation && (isPendingRequest || isRequestExpired || isRequestRejected) && (
-        <div className="sticky top-0 z-40 border-b border-slate-200 bg-white/95 px-4 py-3 backdrop-blur-sm">
+        <div className="sticky top-0 z-10 border-b border-slate-200 bg-white/95 px-4 py-3 backdrop-blur-sm">
           {isPendingReceiver && (
             <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3">
               <p className="text-sm font-semibold text-amber-900">Message Request</p>
@@ -959,7 +969,7 @@ const ChatContainer = () => {
           ) : (
             <>
               {activeDateBadge && (
-                <div className="sticky top-2 z-40 mb-2 flex justify-center pointer-events-none">
+                <div className="sticky top-2 z-5 mb-2 flex justify-center pointer-events-none">
                   <span className="rounded-full border border-slate-200 bg-white/95 px-3 py-1 text-[11px] font-medium text-slate-600 shadow-sm backdrop-blur select-none">
                     {activeDateBadge}
                   </span>

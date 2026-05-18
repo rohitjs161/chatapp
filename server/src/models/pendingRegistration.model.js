@@ -1,4 +1,5 @@
 import mongoose, { Schema } from 'mongoose';
+import { normalizeUsername } from '../utils/validation.js';
 
 const pendingRegistrationSchema = new Schema(
     {
@@ -12,6 +13,7 @@ const pendingRegistrationSchema = new Schema(
             required: true,
             trim: true,
             lowercase: true,
+            set: (value) => normalizeUsername(value),
         },
         email: {
             type: String,

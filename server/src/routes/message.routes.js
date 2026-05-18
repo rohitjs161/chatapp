@@ -7,7 +7,7 @@ import {
     markAsRead,
 } from "../controllers/message.controller.js";
 import { verifyJWT } from "../middlewares/auth.middleware.js";
-import { upload } from "../middlewares/multer.middleware.js";
+import { upload, validateImageUpload } from "../middlewares/multer.middleware.js";
 import {
     sendMessageLimiter,
     editMessageLimiter,
@@ -21,6 +21,7 @@ router.route("/:conversationId").post(
     verifyJWT,
     sendMessageLimiter,
     upload.single("media"),
+    validateImageUpload,
     sendMessage
 );
 

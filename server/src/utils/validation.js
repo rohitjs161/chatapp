@@ -3,6 +3,10 @@ import filterXSS from 'xss';
 const ABOUT_MAX_LENGTH = 160;
 const ABOUT_ALLOWED_CHARS_REGEX = /^[\p{L}\p{M}\p{N}\p{Zs}\n.,!?'@#&:\p{Extended_Pictographic}\u200D\uFE0F-]+$/u;
 const ABOUT_HTML_TAG_REGEX = /<\s*\/\s*[a-z][^>]*>|<\s*[a-z][^>]*>/i;
+const USERNAME_MIN_LENGTH = 3;
+const USERNAME_MAX_LENGTH = 20;
+const USERNAME_ALLOWED_CHARS_REGEX = /^[a-z0-9._]+$/;
+const USERNAME_CONTROL_CHARS_REGEX = /[\u0000-\u001F\u007F-\u009F\u200B-\u200D\u2060\uFEFF]/;
 
 const MAX_EMAIL_LENGTH = 254;
 const MAX_LOCAL_PART_LENGTH = 64;
@@ -77,6 +81,42 @@ const TOP_LEVEL_DOMAIN_REGEX = /^(?:[A-Za-z]{2,63}|xn--[A-Za-z0-9-]{2,59})$/;
 export const normalizeEmail = (email) => {
   if (typeof email !== 'string') return '';
   return email.trim().toLowerCase().replace(/\s/g, '');
+};
+
+export const normalizeUsername = (username) => {
+  if (typeof username !== 'string') return '';
+
+  return username.normalize('NFKC').trim().toLowerCase();
+};
+
+export const getUsernameValidationError = (username) => {
+  const normalizedUsername = normalizeUsername(username);
+
+  if (!normalizedUsername) {
+    return 'Invalid username';
+  }
+
+  if (normalizedUsername.length < USERNAME_MIN_LENGTH || normalizedUsername.length > USERNAME_MAX_LENGTH) {
+    return 'Invalid username';
+  }
+
+  if (USERNAME_CONTROL_CHARS_REGEX.test(String(username || ''))) {
+    return 'Invalid username';
+  }
+
+  if (!USERNAME_ALLOWED_CHARS_REGEX.test(normalizedUsername)) {
+    return 'Invalid username';
+  }
+
+  if (/^[._]|[._]$/.test(normalizedUsername)) {
+    return 'Invalid username';
+  }
+
+  if (/\.\./.test(normalizedUsername)) {
+    return 'Invalid username';
+  }
+
+  return '';
 };
 
 export const isDisposableEmailDomain = (email) => {

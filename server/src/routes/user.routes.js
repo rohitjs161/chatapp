@@ -27,7 +27,7 @@ import {
     fullDatabaseMaintenance,
 } from "../controllers/user.controller.js";
 import { verifyJWT } from "../middlewares/auth.middleware.js";
-import { upload } from "../middlewares/multer.middleware.js";
+import { upload, validateImageUpload } from "../middlewares/multer.middleware.js";
 import {
     registerLimiter,
     signupEmailVerifyLimiter,
@@ -82,6 +82,7 @@ router.route("/profile-picture").patch(
     verifyJWT,
     profilePictureLimiter,
     upload.single("profilePicture"),
+    validateImageUpload,
     updateProfilePicture
 );
 router.route('/notification-preferences')
