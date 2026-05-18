@@ -6,6 +6,7 @@ import {
     logoutUser,
     deleteAccount,
     refreshAccessToken,
+    debugCookies,
     updateUserProfile,
     updateProfilePicture,
     discoverUsers,
@@ -26,11 +27,10 @@ import {
     cleanupDuplicateUsers,
     fullDatabaseMaintenance,
 } from "../controllers/user.controller.js";
-    debugCookies,
+
 import { verifyJWT } from "../middlewares/auth.middleware.js";
 import { upload, validateImageUpload } from "../middlewares/multer.middleware.js";
 import {
-router.route("/debug-cookies").get(generalLimiter, debugCookies);
     registerLimiter,
     signupEmailVerifyLimiter,
     signupEmailResendLimiter,
@@ -63,6 +63,7 @@ router.get("/auth/google", passport.authenticate("google", { scope: ["profile", 
 router.get("/auth/google/callback", passport.authenticate("google", { session: false }), googleAuthCallback);
 
 router.route("/refresh-token").post(refreshTokenLimiter, refreshAccessToken);
+router.route("/debug-cookies").get(generalLimiter, debugCookies);
 router.route("/forgot-password").post(forgotPasswordSendOtpLimiter, forgotPassword);
 router.route("/reset-password").post(forgotPasswordVerifyOtpLimiter, resetPassword);
 router.route("/resend-otp").post(forgotPasswordResendOtpLimiter, resendOTP);
