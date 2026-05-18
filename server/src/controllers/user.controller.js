@@ -1104,7 +1104,17 @@ const refreshAccessToken = asyncHandler(async (req, res) => {
             logger.log('⚠️  No refresh token found (cookie/body/header)');
             // Add a hint for production debugging (do not expose sensitive data)
             logger.warn('Possible causes: cookies blocked by SameSite/secure/domain, missing credentials on client, or wrong API origin.');
-            throw new apiError(401, "No refresh token provided");
+
+            // Instead of throwing an error (which floods logs when users visit public pages without a session),
+            // return a harmless response indicating no session. Clients should handle this by redirecting to login.
+            return res.status(200).json(
+                new apiResponse(
+                    200,
+                    null,
+                    'No refresh token provided',
+                    'no_session'
+                )
+            );
         }
 
         // Helpful debug logging about token source (do not log token value)
