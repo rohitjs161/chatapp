@@ -1076,13 +1076,24 @@ const deleteAccount = asyncHandler(async (req, res) => {
 
 const refreshAccessToken = asyncHandler(async (req, res) => {
     try {
-        // STEP 1: Extract refresh token from HTTP-only cookies (NOT from request body)
-        const incomingRefreshToken = req.cookies?.refreshToken;
+        // STEP 1: Extract refresh token from multiple locations (cookies preferred)
+        // Prefer HTTP-only cookie, but accept body or Authorization header as graceful fallback
+        const cookieToken = req.cookies?.refreshToken;
+        const bodyToken = req.body?.refreshToken;
+        const authHeader = typeof req.headers?.authorization === 'string' ? req.headers.authorization : null;
+        const headerToken = authHeader && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
+
+        const incomingRefreshToken = cookieToken || bodyToken || headerToken;
 
         if (!incomingRefreshToken) {
-            logger.log('⚠️  No refresh token found in cookies');
+            logger.log('⚠️  No refresh token found (cookie/body/header)');
             throw new apiError(401, "No refresh token provided");
         }
+
+        // Helpful debug logging about token source (do not log token value)
+        if (cookieToken) logger.log('ℹ️  Using refresh token from cookie');
+        else if (bodyToken) logger.log('ℹ️  Using refresh token from request body (fallback)');
+        else if (headerToken) logger.log('ℹ️  Using refresh token from Authorization header (fallback)');
 
         // STEP 2: Verify JWT signature
         let decodedToken;
