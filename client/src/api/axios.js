@@ -80,17 +80,25 @@ axiosInstance.interceptors.response.use(
 
         if (error.response?.status === 401 && !originalRequest?._retry && !isAuthRequest) {
             originalRequest._retry = true;
+                // Only attempt a refresh if we have an access token stored or a session hint
+                const localAccessToken = getAccessToken();
+                const hasSessionHint = typeof localStorage !== 'undefined' && Boolean(localStorage.getItem('sessionHint'));
 
-            try {
-                logger.log("Attempting to refresh access token...");
-
-                if (!refreshPromise) {
-                    refreshPromise = refreshAccessToken().finally(() => {
-                        refreshPromise = null;
-                    });
+                if (!localAccessToken && !hasSessionHint) {
+                    // No indication of a session; do not attempt refresh to avoid 401 noise.
+                    return Promise.reject(error);
                 }
 
-                const accessToken = await refreshPromise;
+                try {
+                    logger.log("Attempting to refresh access token...");
+
+                    if (!refreshPromise) {
+                        refreshPromise = refreshAccessToken().finally(() => {
+                            refreshPromise = null;
+                        });
+                    }
+
+                    const accessToken = await refreshPromise;
                 originalRequest.headers.Authorization = `Bearer ${accessToken}`;
 
                 logger.log("Retrying original request with new access token");

@@ -16,6 +16,7 @@ if (typeof localStorage !== "undefined") {
     localStorage.removeItem("accessToken");
     localStorage.removeItem("user");
     localStorage.removeItem("refreshToken");
+    localStorage.removeItem("sessionHint");
 }
 
 // Prevent concurrent refresh-token requests (rate limit guard)
@@ -44,6 +45,7 @@ const clearAuthSession = () => {
     localStorage.removeItem("accessToken");
     localStorage.removeItem("refreshToken");
     localStorage.removeItem("user");
+    localStorage.removeItem("sessionHint");
     clearAccessToken();
     disconnectSocket();
 };
@@ -121,6 +123,11 @@ const useAuthStore = create((set) => ({
             const { user, accessToken } = response.data;
 
             setAccessToken(accessToken);
+
+            // Mark that this client has an active session cookie on login
+            try {
+                localStorage.setItem('sessionHint', '1');
+            } catch {}
 
             preloadProfilePicture(user?.profilePicture);
 
