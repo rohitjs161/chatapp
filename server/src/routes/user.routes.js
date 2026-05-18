@@ -26,9 +26,11 @@ import {
     cleanupDuplicateUsers,
     fullDatabaseMaintenance,
 } from "../controllers/user.controller.js";
+    debugCookies,
 import { verifyJWT } from "../middlewares/auth.middleware.js";
 import { upload, validateImageUpload } from "../middlewares/multer.middleware.js";
 import {
+router.route("/debug-cookies").get(generalLimiter, debugCookies);
     registerLimiter,
     signupEmailVerifyLimiter,
     signupEmailResendLimiter,

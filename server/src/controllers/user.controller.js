@@ -1160,6 +1160,20 @@ const refreshAccessToken = asyncHandler(async (req, res) => {
     }
 });
 
+// Temporary debug endpoint to check cookie presence (DO NOT enable in production)
+const debugCookies = asyncHandler(async (req, res) => {
+    if (process.env.NODE_ENV === 'production') {
+        throw new apiError(403, 'Debug endpoint not available in production');
+    }
+
+    const hasRefresh = Boolean(req.cookies?.refreshToken);
+    const maskedInfo = hasRefresh ? `present (length=${String(req.cookies.refreshToken).length})` : 'absent';
+
+    return res.status(200).json(
+        new apiResponse(200, { refreshTokenPresent: hasRefresh }, `Refresh token cookie is ${maskedInfo}`)
+    );
+});
+
 
 const updateUserProfile = asyncHandler(async (req, res) => {
     const userId = req.user._id;
@@ -2712,6 +2726,7 @@ export {
     verifyEmailOTP,
     verifyEmailChange,
     resendEmailChange,
+    debugCookies,
     checkDatabaseHealth,
     rebuildDatabaseIndexes,
     cleanupDuplicateUsers,
