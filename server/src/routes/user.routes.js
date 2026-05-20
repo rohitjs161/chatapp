@@ -29,6 +29,7 @@ import {
 } from "../controllers/user.controller.js";
 
 import { verifyJWT } from "../middlewares/auth.middleware.js";
+import { apiError } from "../utils/apiError.js";
 import { upload, validateImageUpload } from "../middlewares/multer.middleware.js";
 import {
     registerLimiter,
@@ -49,6 +50,13 @@ import {
 } from "../middlewares/rateLimit.middleware.js";
 
 const router = Router();
+const blockAdminRoutesInProduction = (req, res, next) => {
+    if (process.env.NODE_ENV === "production") {
+        throw new apiError(404, "Not found");
+    }
+
+    next();
+};
 
 // Public routes
 router.route("/register").post(registerLimiter, registerUser);
@@ -100,15 +108,15 @@ router.route('/notification-preferences')
  * For development, these are protected with general rate limiter only
  */
 // Check database health
-router.route('/admin/check-db-health').get(generalLimiter, checkDatabaseHealth);
+router.route('/admin/check-db-health').get(verifyJWT, blockAdminRoutesInProduction, generalLimiter, checkDatabaseHealth);
 
 // Rebuild indexes
-router.route('/admin/rebuild-indexes').post(generalLimiter, rebuildDatabaseIndexes);
+router.route('/admin/rebuild-indexes').post(verifyJWT, blockAdminRoutesInProduction, generalLimiter, rebuildDatabaseIndexes);
 
 // Cleanup duplicates
-router.route('/admin/cleanup-duplicates').post(generalLimiter, cleanupDuplicateUsers);
+router.route('/admin/cleanup-duplicates').post(verifyJWT, blockAdminRoutesInProduction, generalLimiter, cleanupDuplicateUsers);
 
 // Full database maintenance
-router.route('/admin/full-cleanup').post(generalLimiter, fullDatabaseMaintenance);
+router.route('/admin/full-cleanup').post(verifyJWT, blockAdminRoutesInProduction, generalLimiter, fullDatabaseMaintenance);
 
 export default router;

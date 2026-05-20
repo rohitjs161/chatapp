@@ -237,25 +237,13 @@ const throwDuplicateFieldError = (error, attemptedEmail, attemptedUsername) => {
         errorMessage: error?.message,
     });
 
-    if (duplicateField === 'email') {
-        logger.log(`❌ Email duplicate detected: ${attemptedEmail}`);
-        throw new apiError(409, 'This email is already registered. Please use a different email or login.');
+    if (duplicateField) {
+        logger.log(`❌ Duplicate registration detected for ${duplicateField}`);
+    } else {
+        logger.error('❌ Could not determine duplicate field. Race condition suspected.');
     }
 
-    if (duplicateField === 'username') {
-        logger.log(`❌ Username duplicate detected: ${attemptedUsername}`);
-        throw new apiError(409, 'Username already exists');
-    }
-
-    // Fallback: If we can't determine field, it's likely a race condition
-    // But provide hint based on attempted credentials
-    logger.error('❌ Could not determine duplicate field. Race condition suspected.');
-    logger.error('   This might happen if another registration with same credentials happened simultaneously.');
-    
-    throw new apiError(
-        409, 
-        'It looks like this email or username was just registered. Please try again with different credentials.'
-    );
+    throw new apiError(409, 'Unable to create account. Please try again with different credentials.');
 };
 
 const getCookieOptions = () => {
@@ -423,11 +411,11 @@ const registerUser = asyncHandler(async (req, res) => {
     ]);
 
     if (emailExists) {
-        throw new apiError(409, 'Email already registered. Please login.');
+        throw new apiError(409, 'Unable to create account. Please try again with different credentials.');
     }
 
     if (usernameExists) {
-        throw new apiError(409, 'Username already exists');
+        throw new apiError(409, 'Unable to create account. Please try again with different credentials.');
     }
 
     let pendingRegistration;
@@ -700,11 +688,11 @@ const registerUser = asyncHandler(async (req, res) => {
             ]);
 
             if (freshEmailUser) {
-                throw new apiError(409, 'Email already registered. Please login.');
+                throw new apiError(409, 'Unable to create account. Please try again with different credentials.');
             }
 
             if (freshUsernameUser) {
-                throw new apiError(409, 'Username already exists');
+                throw new apiError(409, 'Unable to create account. Please try again with different credentials.');
             }
 
             throwDuplicateFieldError(error, emailNormalized, usernameNormalized);
@@ -751,7 +739,7 @@ const loginUser = asyncHandler(async (req, res) => {
             { email: loginField },
             { username: loginField }
         ]
-    });
+    }).select('+password +refreshToken');
 
     if (!user) {
         return res.status(200).json({
@@ -1079,50 +1067,13 @@ const deleteAccount = asyncHandler(async (req, res) => {
 
 const refreshAccessToken = asyncHandler(async (req, res) => {
     try {
-        // Diagnostic info: log request origin details to help diagnose missing cookies
-        const requestOrigin = req.headers?.origin || req.headers?.referer || null;
-        const hostHeader = req.headers?.host || null;
-        const cookieHeaderPresent = Boolean(req.headers?.cookie);
-        const proto = req.secure || req.headers['x-forwarded-proto'] || req.protocol;
-        logger.log('🔍 Refresh token request info', {
-            origin: requestOrigin,
-            host: hostHeader,
-            proto,
-            cookieHeaderPresent,
-        });
+        const incomingRefreshToken = req.cookies?.refreshToken;
 
-        // STEP 1: Extract refresh token from multiple locations (cookies preferred)
-        // Prefer HTTP-only cookie, but accept body or Authorization header as graceful fallback
-        const cookieToken = req.cookies?.refreshToken;
-        const bodyToken = req.body?.refreshToken;
-        const authHeader = typeof req.headers?.authorization === 'string' ? req.headers.authorization : null;
-        const headerToken = authHeader && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
-
-        const incomingRefreshToken = cookieToken || bodyToken || headerToken;
-
-        if (!incomingRefreshToken) {
-            logger.log('⚠️  No refresh token found (cookie/body/header)');
-            // Add a hint for production debugging (do not expose sensitive data)
-            logger.warn('Possible causes: cookies blocked by SameSite/secure/domain, missing credentials on client, or wrong API origin.');
-
-            // Instead of throwing an error (which floods logs when users visit public pages without a session),
-            // return a harmless response indicating no session. Clients should handle this by redirecting to login.
-            return res.status(200).json(
-                new apiResponse(
-                    200,
-                    null,
-                    'No refresh token provided',
-                    'no_session'
-                )
-            );
+        if (!incomingRefreshToken || typeof incomingRefreshToken !== 'string' || !incomingRefreshToken.trim()) {
+            throw new apiError(401, 'Unauthorized request');
         }
 
-        // Helpful debug logging about token source (do not log token value)
-        if (cookieToken) logger.log('ℹ️  Using refresh token from cookie');
-        else if (bodyToken) logger.log('ℹ️  Using refresh token from request body (fallback)');
-        else if (headerToken) logger.log('ℹ️  Using refresh token from Authorization header (fallback)');
-
-        // STEP 2: Verify JWT signature
+        // Verify JWT signature
         let decodedToken;
         try {
             decodedToken = jwt.verify(
@@ -1130,34 +1081,31 @@ const refreshAccessToken = asyncHandler(async (req, res) => {
                 process.env.REFRESH_TOKEN_SECRET
             );
         } catch (jwtError) {
-            logger.log('⚠️  JWT verification failed:', jwtError.message);
-            if (jwtError.name === 'TokenExpiredError') {
-                throw new apiError(401, "Refresh token has expired");
-            }
-            throw new apiError(401, "Invalid refresh token signature");
+            logger.warn('⚠️  Refresh token verification failed', { name: jwtError?.name });
+            throw new apiError(401, 'Unauthorized request');
         }
 
-        // STEP 3: Fetch user and validate against stored token
-        const user = await User.findById(decodedToken?._id);
+        if (!decodedToken || typeof decodedToken !== 'object' || !decodedToken._id) {
+            throw new apiError(401, 'Unauthorized request');
+        }
+
+        const user = await User.findById(decodedToken._id).select('+refreshToken');
 
         if (!user) {
-            logger.log('⚠️  User not found for token ID:', decodedToken?._id);
-            throw new apiError(401, "User not found");
+            throw new apiError(401, 'Unauthorized request');
         }
 
-        // STEP 4: Verify token matches DB (critical security check)
+        // Verify token matches DB (reject replayed or revoked refresh tokens)
         if (user.refreshToken !== incomingRefreshToken) {
-            logger.log('⚠️  Stored token does not match incoming token - possible token reuse attack or logout');
-            throw new apiError(401, "Refresh token is invalid or has been revoked");
+            logger.warn('⚠️  Refresh token replay or mismatch detected for user', { userId: String(user._id) });
+            throw new apiError(401, 'Unauthorized request');
         }
 
-        // STEP 5: Generate new tokens (rotate refresh token for security)
+        // Rotate tokens to prevent replay attacks
         const { accessToken, refreshToken: newRefreshToken } = await generateAccessAndRefreshTokens(user._id);
 
-        // STEP 6: Set cookies with secure options
         const cookieOptions = getCookieOptions();
-        
-        // Set HTTP-only cookies for both tokens
+
         res.cookie("accessToken", accessToken, {
             ...cookieOptions,
             maxAge: 15 * 60 * 1000, // 15 minutes for access token
@@ -1168,33 +1116,24 @@ const refreshAccessToken = asyncHandler(async (req, res) => {
             maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days for refresh token
         });
 
-        logger.log('✅ Tokens refreshed successfully for user:', user._id);
+        logger.log('✅ Tokens refreshed successfully for user:', String(user._id));
 
-        // STEP 7: Return success response with new access token
-        // NOTE: Only return accessToken in response body (refreshToken stays in HTTP-only cookie)
         return res.status(200).json(
             new apiResponse(
                 200,
-                { accessToken }, // Don't send refreshToken in body - it's in the HTTP-only cookie
+                { accessToken },
                 "Access token refreshed successfully"
             )
         );
 
     } catch (error) {
-        // Log error for debugging with stack
-        logger.error('❌ Refresh token error:', {
-            message: error?.message,
-            name: error?.name,
-            stack: error?.stack,
-        });
+        logger.error('❌ Refresh token error:', { message: error?.message, name: error?.name });
 
-        // If error is already an apiError, rethrow it
         if (error instanceof apiError) {
             throw error;
         }
 
-        // Otherwise wrap in apiError (500 for unexpected server errors)
-        throw new apiError(500, error?.message || "Refresh token processing failed");
+        throw new apiError(401, 'Unauthorized request');
     }
 });
 
@@ -1263,7 +1202,7 @@ const updateUserProfile = asyncHandler(async (req, res) => {
         });
 
         if (existingUsername) {
-            throw new apiError(409, 'Username already exists');
+            throw new apiError(409, 'Unable to update profile. Please try again with different details.');
         }
 
         updates.username = normalizeUsername(username);
@@ -1506,12 +1445,15 @@ const discoverUsers = asyncHandler(async (req, res) => {
         ? Math.min(Math.max(limitParam, 1), 50)
         : 50;
 
-    const searchFilter = query
+    const escapeRegExp = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const safeQuery = escapeRegExp(query);
+
+    const searchFilter = safeQuery
         ? {
             $or: [
-                { fullName: { $regex: query, $options: "i" } },
-                { username: { $regex: query, $options: "i" } },
-                { email: { $regex: query, $options: "i" } },
+                { fullName: { $regex: safeQuery, $options: "i" } },
+                { username: { $regex: safeQuery, $options: "i" } },
+                { email: { $regex: safeQuery, $options: "i" } },
             ],
         }
         : {};
@@ -1520,7 +1462,7 @@ const discoverUsers = asyncHandler(async (req, res) => {
         _id: { $ne: currentUserId },
         ...searchFilter,
     })
-        .select("fullName username email profilePicture bio createdAt")
+        .select("fullName username profilePicture bio createdAt")
         .sort({ fullName: 1, username: 1 })
         .limit(limit)
         .lean();
@@ -2185,15 +2127,11 @@ const checkEmailExists = asyncHandler(async (req, res) => {
         throw new apiError(400, emailError);
     }
 
-    // Availability checks should be based on final users only.
-    const existingUser = await User.findOne({ email: normalizedEmail });
-    const available = !existingUser;
-
     return res.status(200).json(
         new apiResponse(
             200,
-            { available, exists: !available },
-            'Email availability check completed'
+            { checked: true },
+            'Email check completed'
         )
     );
 });
@@ -2215,14 +2153,11 @@ const checkUsernameExists = asyncHandler(async (req, res) => {
         throw new apiError(400, usernameError);
     }
 
-    const existingUser = await User.findOne({ username: normalizedUsername });
-    const available = !existingUser;
-
     return res.status(200).json(
         new apiResponse(
             200,
-            { available, exists: !available },
-            'Username availability check completed'
+            { checked: true },
+            'Username check completed'
         )
     );
 });
@@ -2288,10 +2223,10 @@ const verifyEmailOTP = asyncHandler(async (req, res) => {
             // Remove the pending record and respond safely
             await PendingRegistration.findByIdAndDelete(pending._id);
             if (existingUser.email === normalizedEmail) {
-                return res.status(200).json({ success: false, status: 'error', message: 'Email already registered. Please login.', data: null });
+                return res.status(200).json({ success: false, status: 'error', message: 'Unable to complete verification. Please request a new OTP.', data: null });
             }
 
-            return res.status(200).json({ success: false, status: 'error', message: 'Username already exists', data: null });
+            return res.status(200).json({ success: false, status: 'error', message: 'Unable to complete verification. Please request a new OTP.', data: null });
         }
 
         let createdUser;
@@ -2330,10 +2265,10 @@ const verifyEmailOTP = asyncHandler(async (req, res) => {
     if (!pendingRegistration) {
         const existingUser = await User.findOne({ email: normalizedEmail });
         if (existingUser) {
-            return res.status(200).json({ success: false, status: 'error', message: 'Email already registered. Please login.', data: null });
+            return res.status(200).json({ success: false, status: 'error', message: 'Unable to complete verification. Please request a new OTP.', data: null });
         }
 
-        return res.status(200).json({ success: false, status: 'error', message: 'No pending registration found for this email. Please sign up again.', data: null });
+        return res.status(200).json({ success: false, status: 'error', message: 'Unable to complete verification. Please request a new OTP.', data: null });
     }
 
     // If OTP missing or expired, remove pending and respond generically

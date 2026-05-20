@@ -43,8 +43,8 @@ export const loginLimiter = createRateLimiter(
 );
 
 export const refreshTokenLimiter = createRateLimiter(
-    60, 100,
-    "Too many token refresh attempts. Please try again after 1 hour."
+    15, 20,
+    "Too many token refresh attempts. Please try again later."
 );
 
 // User routes
@@ -112,7 +112,7 @@ export const deleteConversationLimiter = createRateLimiter(
 
 // Message routes
 export const sendMessageLimiter = createRateLimiter(
-    1, 60,
+    1, 30,
     "Too many messages sent. Please slow down."
 );
 
@@ -127,7 +127,7 @@ export const deleteMessageLimiter = createRateLimiter(
 );
 
 export const markAsReadLimiter = createRateLimiter(
-    1, 60,
+    1, 120,
     "Too many read requests. Please slow down."
 );
 

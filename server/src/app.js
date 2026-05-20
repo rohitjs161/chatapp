@@ -1,10 +1,14 @@
 import express from "express";
 import cors from "cors";
+import hpp from "hpp";
 import cookieParser from "cookie-parser";
+import helmet from "helmet";
+import mongoSanitize from "express-mongo-sanitize";
 import passport from "passport";
 import configurePassport from "./config/passport.js";
 import { apiError } from "./utils/apiError.js";
 import { logger } from "./utils/logger.js";
+import { rejectSuspiciousRequestPayload } from "./middlewares/requestSecurity.middleware.js";
 
 const app = express();
 
@@ -41,11 +45,6 @@ const corsOptions = {
         }
 
         const normalizedOrigin = String(origin).trim().replace(/\/+$/, "");
-
-        if (process.env.NODE_ENV === "production" && normalizedOrigin.endsWith(".vercel.app")) {
-            callback(null, true);
-            return;
-        }
 
         if (process.env.NODE_ENV !== "production" && (normalizedOrigin.includes("localhost") || normalizedOrigin.includes("127.0.0.1"))) {
             callback(null, true);
@@ -88,6 +87,14 @@ app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static("public"));
 app.use(cookieParser());
+app.use(helmet());
+app.use(hpp());
+app.use(rejectSuspiciousRequestPayload);
+app.use((req, res, next) => {
+    mongoSanitize.sanitize(req.body);
+    mongoSanitize.sanitize(req.params);
+    next();
+});
 
 // Initialize Passport for Google OAuth
 configurePassport();
@@ -137,8 +144,7 @@ app.use((error, req, res, next) => {
 
     if (error.code === 11000) {
         statusCode = 409;
-        const field = Object.keys(error.keyPattern || {})[0] || "field";
-        message = `${field} already exists`;
+        message = isProduction ? "Conflict" : `${Object.keys(error.keyPattern || {})[0] || "field"} already exists`;
     }
 
     if (error.name === "JsonWebTokenError") {
@@ -174,6 +180,8 @@ app.use((error, req, res, next) => {
             message = "Not found";
         } else if (statusCode === 429) {
             message = "Too many requests";
+        } else if (statusCode === 409) {
+            message = "Conflict";
         } else if (statusCode >= 500) {
             message = "Something went wrong";
         }

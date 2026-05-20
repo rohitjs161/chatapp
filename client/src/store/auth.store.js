@@ -10,14 +10,7 @@ const AUTH_SYNC_CHANNEL = "chatapp-auth-sync";
 
 const authChannel = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel(AUTH_SYNC_CHANNEL) : null;
 const BOOTSTRAP_RETRY_DELAY_MS = 350;
-const BOOTSTRAP_MAX_RETRIES = 3;
-
-if (typeof localStorage !== "undefined") {
-    localStorage.removeItem("accessToken");
-    localStorage.removeItem("user");
-    localStorage.removeItem("refreshToken");
-    localStorage.removeItem("sessionHint");
-}
+const BOOTSTRAP_MAX_RETRIES = 1;
 
 // Prevent concurrent refresh-token requests (rate limit guard)
 let bootstrapPromise = null;
@@ -164,6 +157,7 @@ const useAuthStore = create((set) => ({
 
     bootstrapAuth: async (force = false) => {
         const { hasBootstrapped, accessToken, user } = useAuthStore.getState();
+        const hasSessionHint = typeof localStorage !== "undefined" && Boolean(localStorage.getItem("sessionHint"));
 
         if (hasBootstrapped && !force) {
             return Boolean(accessToken && user);
@@ -231,6 +225,11 @@ const useAuthStore = create((set) => ({
             }
 
             // No access token - try a cookie-based session refresh with a few retries.
+            if (!hasSessionHint && !force) {
+                set({ user: null, accessToken: null, isBootstrapping: false, hasBootstrapped: true, error: null });
+                return false;
+            }
+
             let lastError = null;
 
             for (let attempt = 0; attempt < BOOTSTRAP_MAX_RETRIES; attempt += 1) {

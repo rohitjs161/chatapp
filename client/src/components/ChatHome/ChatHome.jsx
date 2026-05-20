@@ -86,7 +86,27 @@ const ChatHome = () => {
     return (
         <div className={homeGridClassName}>
             <main className="order-1 min-w-0 overflow-hidden md:order-2">
-                <ChatContainer onToggleRightSidebar={() => setIsRightSidebarOpen((current) => !current)} />
+                <div className="relative h-full min-w-0 overflow-hidden">
+                    <ChatContainer
+                        isRightSidebarOpen={isRightSidebarOpen}
+                        onToggleRightSidebar={() => setIsRightSidebarOpen((current) => !current)}
+                    />
+
+                    {selectedConversation && (
+                        <div className={`pointer-events-none absolute inset-0 z-30 bg-slate-950/35 transition-opacity duration-300 ${isRightSidebarOpen ? 'opacity-100' : 'opacity-0'}`} />
+                    )}
+
+                    {selectedConversation && (
+                        <aside
+                            className={`pointer-events-auto absolute right-0 top-0 z-40 h-full w-full max-w-[360px] overflow-hidden border-l border-slate-200 bg-white shadow-2xl transition-transform duration-300 ease-out ${isRightSidebarOpen ? 'translate-x-0' : 'translate-x-full'}`}
+                        >
+                            <RightSidebar
+                                selectedConversation={selectedConversation}
+                                onClose={() => setIsRightSidebarOpen(false)}
+                            />
+                        </aside>
+                    )}
+                </div>
             </main>
 
             <aside className="order-2 min-w-0 overflow-hidden md:order-1 md:border-r md:border-slate-200">
@@ -97,25 +117,6 @@ const ChatHome = () => {
                 />
             </aside>
 
-            {selectedConversation && (
-                <>
-                    <button
-                        type="button"
-                        aria-label="Close contact info"
-                        onClick={() => setIsRightSidebarOpen(false)}
-                        className={`fixed inset-0 z-30 bg-slate-950/35 transition-opacity duration-300 md:left-[271px] ${isRightSidebarOpen ? 'pointer-events-auto opacity-100' : 'pointer-events-none opacity-0'}`}
-                    />
-
-                    <aside
-                        className={`fixed right-0 top-0 z-40 h-dvh w-full max-w-[360px] overflow-hidden border-l border-slate-200 bg-white shadow-2xl transition-transform duration-300 ease-out ${isRightSidebarOpen ? 'translate-x-0' : 'translate-x-full'}`}
-                    >
-                        <RightSidebar
-                            selectedConversation={selectedConversation}
-                            onClose={() => setIsRightSidebarOpen(false)}
-                        />
-                    </aside>
-                </>
-            )}
         </div>
     );
 };

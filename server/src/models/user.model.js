@@ -90,7 +90,8 @@ const userSchema = new Schema({
         },
     },
     refreshToken: {
-            type: String
+            type: String,
+            select: false
     },
     resetPasswordOTP: {
         type: String,
@@ -202,6 +203,36 @@ const userSchema = new Schema({
 {
     timestamps: true,
 });
+
+const stripSensitiveUserFields = (_, ret) => {
+    delete ret.password;
+    delete ret.refreshToken;
+    delete ret.resetPasswordOTP;
+    delete ret.resetPasswordOTPExpiry;
+    delete ret.resetPasswordAttempts;
+    delete ret.resetPasswordBlockedUntil;
+    delete ret.resetPasswordOtpResendAttempts;
+    delete ret.resetPasswordOtpResendBlockedUntil;
+    delete ret.deleteAccountOTP;
+    delete ret.deleteAccountOTPExpiry;
+    delete ret.deleteAccountAttempts;
+    delete ret.deleteAccountBlockedUntil;
+    delete ret.deleteAccountOtpResendAttempts;
+    delete ret.deleteAccountOtpResendBlockedUntil;
+    delete ret.emailVerificationOTP;
+    delete ret.emailVerificationOTPExpiry;
+    delete ret.emailVerificationAttempts;
+    delete ret.emailVerificationBlockedUntil;
+    delete ret.emailOtp;
+    delete ret.emailOtpExpiry;
+    delete ret.emailOtpResendAvailableAt;
+    delete ret.emailOtpResendAttempts;
+    delete ret.emailOtpResendBlockedUntil;
+    return ret;
+};
+
+userSchema.set("toJSON", { transform: stripSensitiveUserFields });
+userSchema.set("toObject", { transform: stripSensitiveUserFields });
 
 userSchema.index({ username: 1 }, { unique: true, name: 'uniq_username' });
 userSchema.index({ email: 1 }, { unique: true, name: 'uniq_email' });

@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import { Readable } from "stream";
 import { Message } from "../models/message.model.js";
 import { Conversation } from "../models/conversation.model.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
@@ -21,6 +22,8 @@ import { reservePendingMessageSlot } from "../utils/requestReservation.js";
 const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
 
 const getIo = () => getSocketServer();
+
+const buildProtectedMediaUrl = (messageId) => `/api/v1/messages/${String(messageId)}/media`;
 
 // Validate conversation exists and user is participant
 const validateConversationAccess = async (conversationId, userId) => {
@@ -104,7 +107,7 @@ const serializeMessage = (message) => {
         conversation: String(conversationId),
         conversationId: String(conversationId), // Alternate field for compatibility
         content: messageObj.content || "",
-        mediaUrl: messageObj.mediaUrl || null,
+        mediaUrl: messageObj.mediaUrl ? buildProtectedMediaUrl(messageObj._id) : null,
         isEdited: Boolean(messageObj.isEdited),
         isDeleted: Boolean(messageObj.isDeleted),
         deliveredTo: Array.isArray(messageObj.deliveredTo)
@@ -360,6 +363,54 @@ const sendMessage = asyncHandler(async (req, res) => {
 });
 
 // --------------------------------------------------
+// GET MESSAGE MEDIA
+// GET /api/v1/messages/:messageId/media
+// --------------------------------------------------
+const getMessageMedia = asyncHandler(async (req, res) => {
+    const { messageId } = req.params;
+    const userId = req.user?._id;
+
+    if (!isValidId(messageId)) {
+        throw new apiError(400, "Invalid Message ID");
+    }
+
+    if (!isValidId(userId)) {
+        throw new apiError(401, "Unauthorized request");
+    }
+
+    const message = await Message.findById(messageId).select("conversation mediaUrl isDeleted");
+
+    if (!message || message.isDeleted || !message.mediaUrl) {
+        throw new apiError(404, "Media not found");
+    }
+
+    const conversation = await validateConversationAccess(message.conversation, userId);
+    const { conversation: activeConversation, expired } = await expireConversationIfNeeded(conversation);
+
+    if (expired) {
+        throw new apiError(403, "Media is unavailable for expired requests");
+    }
+
+    if (activeConversation.status !== "accepted") {
+        throw new apiError(403, "Media is only available after request acceptance");
+    }
+
+    const mediaResponse = await fetch(message.mediaUrl);
+
+    if (!mediaResponse.ok || !mediaResponse.body) {
+        logger.warn(`⚠️ Media fetch failed for message ${messageId}: ${mediaResponse.status}`);
+        throw new apiError(502, "Unable to load media");
+    }
+
+    const contentType = mediaResponse.headers.get("content-type") || "application/octet-stream";
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Cache-Control", "private, no-store, max-age=0, must-revalidate");
+
+    const nodeStream = Readable.fromWeb(mediaResponse.body);
+    nodeStream.pipe(res);
+});
+
+// --------------------------------------------------
 // GET ALL MESSAGES
 // GET /api/v1/messages/:conversationId
 // --------------------------------------------------
@@ -611,4 +662,5 @@ export {
     editMessage,
     deleteMessage,
     markAsRead,
+    getMessageMedia,
 };

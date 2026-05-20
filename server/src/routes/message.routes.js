@@ -5,6 +5,7 @@ import {
     editMessage,
     deleteMessage,
     markAsRead,
+    getMessageMedia,
 } from "../controllers/message.controller.js";
 import { verifyJWT } from "../middlewares/auth.middleware.js";
 import { upload, validateImageUpload } from "../middlewares/multer.middleware.js";
@@ -26,6 +27,8 @@ router.route("/:conversationId").post(
 );
 
 router.route("/:conversationId").get(verifyJWT, getMessages);
+
+router.route("/:messageId/media").get(verifyJWT, getMessageMedia);
 
 router.route("/:messageId").patch(
     verifyJWT,

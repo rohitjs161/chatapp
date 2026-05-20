@@ -26,7 +26,7 @@ const getCalendarDayDiffFromToday = (dateValue) => {
   return Math.floor((todayStart - targetStart) / DAY_IN_MS)
 }
 
-const ChatContainer = ({ onToggleRightSidebar }) => {
+const ChatContainer = ({ onToggleRightSidebar, isRightSidebarOpen = false }) => {
   const [message, setMessage] = useState('')
   const [showEmojiPicker, setShowEmojiPicker] = useState(false)
   const [activeMenuId, setActiveMenuId] = useState(null)
@@ -872,15 +872,31 @@ const ChatContainer = ({ onToggleRightSidebar }) => {
           </div>
         </div>
         <div className="flex items-center gap-1 sm:gap-2">
-          <button
-            type="button"
-            onClick={onToggleRightSidebar}
-            className="p-2 rounded-lg hover:bg-gray-100 transition-colors text-gray-600 hover:text-gray-800"
-            title="View contact info"
-            aria-label="View contact info"
-          >
-            <span className="text-xl">⋮</span>
-          </button>
+          {selectedConversation ? (
+            <button
+              type="button"
+              onClick={onToggleRightSidebar}
+              aria-pressed={isRightSidebarOpen}
+              className={`group inline-flex h-10 w-10 items-center justify-center rounded-full border transition-all duration-200 focus:outline-none focus:ring-4 focus:ring-sky-100 ${isRightSidebarOpen ? 'border-sky-200 bg-sky-50 text-sky-700 shadow-sm' : 'border-gray-200 bg-white text-gray-500 hover:border-gray-300 hover:bg-gray-50 hover:text-gray-900 shadow-sm'}`}
+              title={isRightSidebarOpen ? 'Hide contact info' : 'View contact info'}
+              aria-label="View contact info"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                className={`h-5 w-5 transition-transform duration-200 ${isRightSidebarOpen ? 'rotate-90' : 'group-hover:scale-110'}`}
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <circle cx="12" cy="5" r="1.5" fill="currentColor" stroke="none" />
+                <circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none" />
+                <circle cx="12" cy="19" r="1.5" fill="currentColor" stroke="none" />
+              </svg>
+            </button>
+          ) : null}
         </div>
       </div>
 

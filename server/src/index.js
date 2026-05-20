@@ -961,7 +961,7 @@ io.on("connection", (socket) => {
                 sender: newMessage.sender,
                 conversation: newMessage.conversation,
                 content: newMessage.content,
-                mediaUrl: newMessage.mediaUrl,
+                mediaUrl: newMessage.mediaUrl ? `/api/v1/messages/${newMessage._id}/media` : null,
                 createdAt: newMessage.createdAt,
                 isEdited: false,
                 isDeleted: false,
