@@ -1,9 +1,9 @@
 const readStoredAccessToken = () => {
-    if (typeof sessionStorage === "undefined") {
+    if (typeof localStorage === "undefined") {
         return null;
     }
 
-    const token = sessionStorage.getItem("accessToken");
+    const token = localStorage.getItem("accessToken");
     return typeof token === "string" && token.trim() ? token.trim() : null;
 };
 
@@ -14,11 +14,11 @@ export const getAccessToken = () => accessToken;
 export const setAccessToken = (token) => {
     accessToken = typeof token === "string" && token.trim() ? token.trim() : null;
 
-    if (typeof sessionStorage !== "undefined") {
+    if (typeof localStorage !== "undefined") {
         if (accessToken) {
-            sessionStorage.setItem("accessToken", accessToken);
+            localStorage.setItem("accessToken", accessToken);
         } else {
-            sessionStorage.removeItem("accessToken");
+            localStorage.removeItem("accessToken");
         }
     }
 };
@@ -26,7 +26,7 @@ export const setAccessToken = (token) => {
 export const clearAccessToken = () => {
     accessToken = null;
 
-    if (typeof sessionStorage !== "undefined") {
-        sessionStorage.removeItem("accessToken");
+    if (typeof localStorage !== "undefined") {
+        localStorage.removeItem("accessToken");
     }
 };
