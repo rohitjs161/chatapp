@@ -11,6 +11,7 @@ import mongoose from "mongoose";
 import { setSocketServer } from "./socket/io.js";
 import { logger } from "./utils/logger.js";
 import { reservePendingMessageSlot } from "./utils/requestReservation.js";
+import { findParticipantConversation } from "./utils/conversationAccess.js";
 
 const emitConversationUnreadCountToUsers = (conversationId, participants, unreadCounters = {}) => {
     const participantIds = Array.isArray(participants)
@@ -616,48 +617,27 @@ io.on("connection", (socket) => {
         }
     });
 
-    // --------------------------------------------------
-    // JOIN CONVERSATION ROOM (Validate Access)
-    // --------------------------------------------------
-    socket.on("join-conversation", async (conversationId, ack) => {
+    const handleJoinConversation = async (conversationId, ack) => {
         try {
             const trimmedConversationId = typeof conversationId === "string" ? conversationId.trim() : "";
 
-            // Validate conversationId format
             if (!trimmedConversationId || !isValidObjectId(trimmedConversationId)) {
                 socket.emit("error", { message: "Invalid conversation ID format", code: "INVALID_CONV_ID" });
                 replyAck(ack, { success: false, code: "INVALID_CONV_ID", message: "Invalid conversation ID format" });
                 return;
             }
 
-            // Security: Verify user is authenticated (double-check token is still valid)
             if (!socket.userId || !socket.user) {
                 socket.emit("error", { message: "Authentication required", code: "AUTH_REQUIRED" });
                 replyAck(ack, { success: false, code: "AUTH_REQUIRED", message: "Authentication required" });
                 return;
             }
 
-            // Verify conversation exists and user is a participant in a single query
-            const conversation = await Conversation.findOne({
-                _id: trimmedConversationId,
-                participants: socket.userId,
-            }).select("_id participants");
-
-            if (!conversation) {
-                logger.warn(`🚨 SECURITY: Unauthorized join attempt - User ${socket.userId} tried to join conversation ${trimmedConversationId}`);
-                socket.emit("error", { message: "Access denied or conversation not found", code: "CONV_ACCESS_DENIED" });
-                replyAck(ack, { success: false, code: "CONV_ACCESS_DENIED", message: "Access denied or conversation not found" });
-                return;
-            }
-
-            // Additional security: Verify socket user ID matches database participant
-            const isParticipant = conversation.participants.some(p => String(p) === String(socket.userId));
-            if (!isParticipant) {
-                logger.warn(`🚨 SECURITY: Participant mismatch - User ${socket.userId} claimed access to conversation ${trimmedConversationId}`);
-                socket.emit("error", { message: "Access denied", code: "CONV_ACCESS_DENIED" });
-                replyAck(ack, { success: false, code: "CONV_ACCESS_DENIED", message: "Access denied" });
-                return;
-            }
+            await findParticipantConversation({
+                conversationId: trimmedConversationId,
+                userId: socket.userId,
+                select: "_id participants",
+            });
 
             socket.join(trimmedConversationId);
             socket.data.joinedConversationIds.add(trimmedConversationId);
@@ -665,16 +645,20 @@ io.on("connection", (socket) => {
             replyAck(ack, { success: true, code: "SUCCESS", data: { conversationId: trimmedConversationId } });
             logger.log(`✅ User ${socket.userId} securely joined conversation: ${trimmedConversationId}`);
         } catch (error) {
-            logger.error("❌ Error joining conversation:", error.message);
-            socket.emit("error", { message: "Failed to join conversation", code: "JOIN_ERROR" });
-            replyAck(ack, { success: false, code: "JOIN_ERROR", message: "Failed to join conversation" });
+            const isUnauthorized = error?.message === "Unauthorized access";
+            logger.warn(`🚨 SECURITY: Unauthorized join attempt - User ${socket.userId} tried to join conversation ${typeof conversationId === "string" ? conversationId.trim() : ""}`);
+            socket.emit("error", { message: isUnauthorized ? "Access denied or conversation not found" : "Failed to join conversation", code: isUnauthorized ? "CONV_ACCESS_DENIED" : "JOIN_ERROR" });
+            replyAck(ack, { success: false, code: isUnauthorized ? "CONV_ACCESS_DENIED" : "JOIN_ERROR", message: isUnauthorized ? "Access denied or conversation not found" : "Failed to join conversation" });
         }
-    });
+    };
 
     // --------------------------------------------------
-    // LEAVE CONVERSATION ROOM (Verify Authorization)
+    // JOIN CONVERSATION ROOM (Validate Access)
     // --------------------------------------------------
-    socket.on("leave-conversation", async (conversationId, ack) => {
+    socket.on("join-conversation", handleJoinConversation);
+    socket.on("joinConversation", handleJoinConversation);
+
+    const handleLeaveConversation = async (conversationId, ack) => {
         try {
             const trimmedConversationId = typeof conversationId === "string" ? conversationId.trim() : "";
 
@@ -684,18 +668,17 @@ io.on("connection", (socket) => {
                 return;
             }
 
-            // Security: Verify user is actually a participant before allowing leave
-            const conversation = await Conversation.findOne({
-                _id: trimmedConversationId,
-                participants: socket.userId,
-            }).select("_id");
-
-            if (!conversation) {
-                logger.warn(`🚨 SECURITY: Unauthorized leave attempt - User ${socket.userId} tried to leave conversation ${trimmedConversationId}`);
-                socket.emit("error", { message: "Access denied or conversation not found", code: "CONV_ACCESS_DENIED" });
-                replyAck(ack, { success: false, code: "CONV_ACCESS_DENIED", message: "Access denied or conversation not found" });
+            if (!socket.userId || !socket.user) {
+                socket.emit("error", { message: "Authentication required", code: "AUTH_REQUIRED" });
+                replyAck(ack, { success: false, code: "AUTH_REQUIRED", message: "Authentication required" });
                 return;
             }
+
+            await findParticipantConversation({
+                conversationId: trimmedConversationId,
+                userId: socket.userId,
+                select: "_id",
+            });
 
             socket.leave(trimmedConversationId);
             socket.data.joinedConversationIds.delete(trimmedConversationId);
@@ -703,11 +686,18 @@ io.on("connection", (socket) => {
             replyAck(ack, { success: true, code: "SUCCESS", data: { conversationId: trimmedConversationId } });
             logger.log(`✅ User ${socket.userId} left conversation: ${trimmedConversationId}`);
         } catch (error) {
-            logger.error("❌ Error leaving conversation:", error.message);
-            socket.emit("error", { message: "Failed to leave conversation", code: "LEAVE_ERROR" });
-            replyAck(ack, { success: false, code: "LEAVE_ERROR", message: "Failed to leave conversation" });
+            const isUnauthorized = error?.message === "Unauthorized access";
+            logger.warn(`🚨 SECURITY: Unauthorized leave attempt - User ${socket.userId} tried to leave conversation ${typeof conversationId === "string" ? conversationId.trim() : ""}`);
+            socket.emit("error", { message: isUnauthorized ? "Access denied or conversation not found" : "Failed to leave conversation", code: isUnauthorized ? "CONV_ACCESS_DENIED" : "LEAVE_ERROR" });
+            replyAck(ack, { success: false, code: isUnauthorized ? "CONV_ACCESS_DENIED" : "LEAVE_ERROR", message: isUnauthorized ? "Access denied or conversation not found" : "Failed to leave conversation" });
         }
-    });
+    };
+
+    // --------------------------------------------------
+    // LEAVE CONVERSATION ROOM (Verify Authorization)
+    // --------------------------------------------------
+    socket.on("leave-conversation", handleLeaveConversation);
+    socket.on("leaveConversation", handleLeaveConversation);
 
     // --------------------------------------------------
     // SEND MESSAGE (With Database Persistence)

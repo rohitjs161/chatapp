@@ -153,7 +153,7 @@ export const removeDuplicates = async () => {
     try {
         logger.log('\n🗑️  Removing duplicate users...\n');
         
-        const users = await User.find().sort({ createdAt: 1 });
+        const users = await User.find().select('email username _id createdAt').sort({ createdAt: 1 });
         
         const emailMap = new Map();
         const usersToDelete = [];

@@ -8,6 +8,7 @@ import { apiResponse } from "../utils/apiResponse.js";
 import { uploadOnCloudinary, deleteFromCloudinary } from "../utils/cloudinary.js";
 import { emitToUserRoom, getSocketServer } from "../socket/io.js";
 import { logger } from "../utils/logger.js";
+import { assertValidObjectId, findParticipantConversation, isValidObjectId } from "../utils/conversationAccess.js";
 import {
     expireConversationIfNeeded,
     getRequestReceiverId,
@@ -18,58 +19,26 @@ import { reservePendingMessageSlot } from "../utils/requestReservation.js";
 // HELPERS
 // --------------------------------------------------
 
-// Validate MongoDB ObjectId
-const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
-
 const getIo = () => getSocketServer();
 
 const buildProtectedMediaUrl = (messageId) => `/api/v1/messages/${String(messageId)}/media`;
 
 // Validate conversation exists and user is participant
 const validateConversationAccess = async (conversationId, userId) => {
-    if (!isValidId(conversationId)) {
-        throw new apiError(400, "Invalid Conversation ID");
-    }
-
-    if (!isValidId(userId)) {
-        throw new apiError(400, "Invalid User ID");
-    }
-
-    const conversation = await Conversation.findById(conversationId).select(
-        "participants status initiator pendingMessageCount expiresAt"
-    );
-
-    if (!conversation) {
-        throw new apiError(404, "Conversation not found");
-    }
-
-    const isParticipant = conversation.participants.some(
-        (p) => p.toString() === userId.toString()
-    );
-
-    if (!isParticipant) {
-        // Log security violation
-        logger.warn(`🚨 SECURITY: Unauthorized access attempt - User ${userId} tried to access conversation ${conversationId}`);
-        throw new apiError(403, "You are not part of this conversation");
-    }
-
-    return conversation;
+    return findParticipantConversation({
+        conversationId,
+        userId,
+        select: "participants status initiator pendingMessageCount expiresAt",
+    });
 };
 
 // Enhanced security validation for sensitive operations
 const validateSensitiveAccess = async (conversationId, userId, operation = "access") => {
-    // Re-verify user is a participant (defense-in-depth)
-    const conversation = await Conversation.findOne({
-        _id: conversationId,
-        participants: userId,
-    }).select("participants");
-
-    if (!conversation) {
-        logger.warn(`🚨 SECURITY: Unauthorized ${operation} - User ${userId} on conversation ${conversationId}`);
-        throw new apiError(403, "Unauthorized operation");
-    }
-
-    return conversation;
+    return findParticipantConversation({
+        conversationId,
+        userId,
+        select: "participants",
+    });
 };
 
 const emitRequestExpired = (conversation) => {
@@ -157,11 +126,10 @@ const emitMessageToParticipants = async (conversation, message) => {
 
 // Validate message exists and user is the sender
 const validateMessageOwnership = async (messageId, userId) => {
-    if (!isValidId(messageId)) {
-        throw new apiError(400, "Invalid Message ID");
-    }
+    assertValidObjectId(messageId, "Message ID");
+    assertValidObjectId(userId, "User ID");
 
-    const message = await Message.findById(messageId);
+    const message = await Message.findById(messageId).select("sender conversation isDeleted mediaUrl content");
     if (!message) {
         throw new apiError(404, "Message not found");
     }
@@ -370,13 +338,8 @@ const getMessageMedia = asyncHandler(async (req, res) => {
     const { messageId } = req.params;
     const userId = req.user?._id;
 
-    if (!isValidId(messageId)) {
-        throw new apiError(400, "Invalid Message ID");
-    }
-
-    if (!isValidId(userId)) {
-        throw new apiError(401, "Unauthorized request");
-    }
+    assertValidObjectId(messageId, "Message ID");
+    assertValidObjectId(userId, "User ID");
 
     const message = await Message.findById(messageId).select("conversation mediaUrl isDeleted");
 
@@ -516,14 +479,9 @@ const deleteMessage = asyncHandler(async (req, res) => {
     const { messageId } = req.params;
     const userId = req.user._id;
 
-    if (!isValidId(messageId)) {
-        throw new apiError(400, "Invalid Message ID");
-    }
+    assertValidObjectId(messageId, "Message ID");
 
-    const message = await Message.findById(messageId);
-    if (!message) {
-        throw new apiError(404, "Message not found");
-    }
+    const message = await validateMessageOwnership(messageId, userId);
 
     // Security: Verify user can access the conversation and allow delete
     await validateConversationAccess(message.conversation, userId);
@@ -558,7 +516,7 @@ const deleteMessage = asyncHandler(async (req, res) => {
     // --------------------------------------------------
     // STEP 3: Emit real-time delete event to all conversation participants (user rooms)
     // --------------------------------------------------
-    const conversation = await Conversation.findById(message.conversation).lean();
+    const conversation = await Conversation.findById(message.conversation).select("participants").lean();
     const participantIds = Array.isArray(conversation?.participants)
         ? conversation.participants.map((participant) => String(participant?._id || participant)).filter(Boolean)
         : [];

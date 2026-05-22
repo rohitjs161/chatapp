@@ -1,11 +1,13 @@
 import mongoose from "mongoose";
 import { Conversation } from "../models/conversation.model.js";
 import { Message } from "../models/message.model.js";
+import { SAFE_USER_SELECT } from "../utils/safeUser.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { apiError } from "../utils/apiError.js";
 import { apiResponse } from "../utils/apiResponse.js";
 import { emitToUserRoom } from "../socket/io.js";
 import { expireConversationIfNeeded, getRequestExpiryDate, getRequestReceiverId } from "../utils/conversationRequest.js";
+import { findParticipantConversation } from "../utils/conversationAccess.js";
 
 // --------------------------------------------------
 // HELPERS
@@ -77,7 +79,7 @@ const getOrCreateConversation = asyncHandler(async (req, res) => {
     let conversation = await Conversation.findOne({
         participants: { $all: [senderId, receiverId] }
     })
-        .populate("participants", "-password -refreshToken -profilePicturePublicId")
+        .populate("participants", SAFE_USER_SELECT)
         .populate({
             path: "lastMessage",
             populate: {
@@ -141,7 +143,7 @@ const getOrCreateConversation = asyncHandler(async (req, res) => {
 
     // Populate after creation
     conversation = await conversation.populate([
-        { path: "participants", select: "-password -refreshToken -profilePicturePublicId" },
+        { path: "participants", select: SAFE_USER_SELECT },
         { path: "lastMessage" }
     ]);
 
@@ -161,7 +163,7 @@ const getUserConversations = asyncHandler(async (req, res) => {
     const conversations = await Conversation.find({
         participants: userId
     })
-        .populate("participants", "-password -refreshToken -profilePicturePublicId")
+        .populate("participants", SAFE_USER_SELECT)
         .populate({
             path: "lastMessage",
             populate: {
@@ -198,25 +200,11 @@ const deleteConversation = asyncHandler(async (req, res) => {
     const { conversationId } = req.params;
     const userId = req.user._id;
 
-    // Validate conversationId format
-    if (!mongoose.Types.ObjectId.isValid(conversationId)) {
-        throw new apiError(400, "Invalid Conversation ID");
-    }
-
-    // Find conversation
-    const conversation = await Conversation.findById(conversationId);
-    if (!conversation) {
-        throw new apiError(404, "Conversation not found");
-    }
-
-    // Only participants can delete
-    const isParticipant = conversation.participants.some(
-        (p) => p.toString() === userId.toString()
-    );
-
-    if (!isParticipant) {
-        throw new apiError(403, "You are not authorized to delete this conversation");
-    }
+    await findParticipantConversation({
+        conversationId,
+        userId,
+        select: "_id participants",
+    });
 
     // Delete conversation and all its messages
     await Conversation.findByIdAndDelete(conversationId);
@@ -232,22 +220,15 @@ const updateConversationMute = asyncHandler(async (req, res) => {
     const userId = req.user._id;
     const { muted } = req.body || {};
 
-    if (!mongoose.Types.ObjectId.isValid(conversationId)) {
-        throw new apiError(400, "Invalid Conversation ID");
-    }
-
     if (typeof muted !== "boolean") {
         throw new apiError(400, "muted must be a boolean");
     }
 
-    const conversation = await Conversation.findOne({
-        _id: conversationId,
-        participants: userId,
-    }).populate("participants", "-password -refreshToken -profilePicturePublicId");
-
-    if (!conversation) {
-        throw new apiError(404, "Conversation not found");
-    }
+    await findParticipantConversation({
+        conversationId,
+        userId,
+        select: "_id participants",
+    });
 
     const update = muted
         ? { $addToSet: { mutedUsers: userId } }
@@ -258,7 +239,7 @@ const updateConversationMute = asyncHandler(async (req, res) => {
         update,
         { new: true }
     )
-        .populate("participants", "-password -refreshToken -profilePicturePublicId")
+        .populate("participants", SAFE_USER_SELECT)
         .populate({
             path: "lastMessage",
             populate: {
@@ -287,26 +268,20 @@ const acceptConversationRequest = asyncHandler(async (req, res) => {
     const { conversationId } = req.params;
     const userId = req.user._id;
 
-    if (!mongoose.Types.ObjectId.isValid(conversationId)) {
-        throw new apiError(400, "Invalid Conversation ID");
-    }
-
-    const conversation = await Conversation.findOne({
-        _id: conversationId,
-        participants: userId,
-    })
-        .populate("participants", "-password -refreshToken -profilePicturePublicId")
-        .populate({
-            path: "lastMessage",
-            populate: {
-                path: "sender",
-                select: "fullName username profilePicture",
+    const conversation = await findParticipantConversation({
+        conversationId,
+        userId,
+        populate: [
+            { path: "participants", select: SAFE_USER_SELECT },
+            {
+                path: "lastMessage",
+                populate: {
+                    path: "sender",
+                    select: "fullName username profilePicture",
+                },
             },
-        });
-
-    if (!conversation) {
-        throw new apiError(404, "Conversation not found");
-    }
+        ],
+    });
 
     const { conversation: maybeExpiredConversation, expired } = await expireConversationIfNeeded(conversation);
     if (expired) {
@@ -357,26 +332,20 @@ const rejectConversationRequest = asyncHandler(async (req, res) => {
     const { conversationId } = req.params;
     const userId = req.user._id;
 
-    if (!mongoose.Types.ObjectId.isValid(conversationId)) {
-        throw new apiError(400, "Invalid Conversation ID");
-    }
-
-    const conversation = await Conversation.findOne({
-        _id: conversationId,
-        participants: userId,
-    })
-        .populate("participants", "-password -refreshToken -profilePicturePublicId")
-        .populate({
-            path: "lastMessage",
-            populate: {
-                path: "sender",
-                select: "fullName username profilePicture",
+    const conversation = await findParticipantConversation({
+        conversationId,
+        userId,
+        populate: [
+            { path: "participants", select: SAFE_USER_SELECT },
+            {
+                path: "lastMessage",
+                populate: {
+                    path: "sender",
+                    select: "fullName username profilePicture",
+                },
             },
-        });
-
-    if (!conversation) {
-        throw new apiError(404, "Conversation not found");
-    }
+        ],
+    });
 
     const { conversation: maybeExpiredConversation, expired } = await expireConversationIfNeeded(conversation);
     if (expired) {

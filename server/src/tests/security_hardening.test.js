@@ -237,10 +237,14 @@ describe('security hardening', () => {
   });
 
   test('message fetch is denied for non-members', async () => {
+    Conversation.findOne.mockReturnValueOnce({
+      select: jest.fn().mockResolvedValue(null),
+    });
+
     const response = await request(app).get('/messages/507f1f77bcf86cd799439099');
 
     expect(response.status).toBe(403);
-    expect(Conversation.findById).toHaveBeenCalled();
+    expect(Conversation.findOne).toHaveBeenCalled();
   });
 
   test('media downloads are blocked before acceptance', async () => {
@@ -253,13 +257,14 @@ describe('security hardening', () => {
       }),
     });
 
-    Conversation.findById.mockReturnValueOnce({
-      select() { return this; },
-      participants: [{ _id: '507f1f77bcf86cd799439011' }, { _id: '507f1f77bcf86cd799439012' }],
-      status: 'pending',
-      initiator: '507f1f77bcf86cd799439011',
-      expiresAt: new Date(Date.now() + 86400000),
-      save: jest.fn(),
+    Conversation.findOne.mockReturnValueOnce({
+      select: jest.fn().mockResolvedValue({
+        participants: [{ _id: '507f1f77bcf86cd799439011' }, { _id: '507f1f77bcf86cd799439012' }],
+        status: 'pending',
+        initiator: '507f1f77bcf86cd799439011',
+        expiresAt: new Date(Date.now() + 86400000),
+        save: jest.fn(),
+      }),
     });
 
     const response = await request(app)
@@ -271,18 +276,27 @@ describe('security hardening', () => {
 
   test('message edit is denied for non-owners', async () => {
     Message.findById.mockReturnValueOnce({
-      _id: '507f1f77bcf86cd799439022',
-      sender: { toString: () => '507f1f77bcf86cd799439012' },
-      conversation: '507f1f77bcf86cd799439099',
-      isDeleted: false,
-      content: 'original',
-      mediaUrl: null,
+      select: () => Promise.resolve({
+        _id: '507f1f77bcf86cd799439022',
+        sender: { toString: () => '507f1f77bcf86cd799439012' },
+        conversation: '507f1f77bcf86cd799439099',
+        isDeleted: false,
+        content: 'original',
+        mediaUrl: null,
+      }),
     });
 
-    Conversation.findById.mockReturnValueOnce({
-      select() { return this; },
-      participants: [{ _id: '507f1f77bcf86cd799439011' }, { _id: '507f1f77bcf86cd799439012' }],
-    });
+    Conversation.findOne
+      .mockReturnValueOnce({
+        select: jest.fn().mockResolvedValue({
+          participants: [{ _id: '507f1f77bcf86cd799439011' }, { _id: '507f1f77bcf86cd799439012' }],
+        }),
+      })
+      .mockReturnValueOnce({
+        select: jest.fn().mockResolvedValue({
+          participants: [{ _id: '507f1f77bcf86cd799439011' }, { _id: '507f1f77bcf86cd799439012' }],
+        }),
+      });
 
     const response = await request(app)
       .patch('/edit/507f1f77bcf86cd799439022')
@@ -294,18 +308,27 @@ describe('security hardening', () => {
 
   test('message delete is denied for non-owners', async () => {
     Message.findById.mockReturnValueOnce({
-      _id: '507f1f77bcf86cd799439023',
-      sender: { toString: () => '507f1f77bcf86cd799439012' },
-      conversation: '507f1f77bcf86cd799439099',
-      isDeleted: false,
-      mediaUrl: null,
-      save: jest.fn(),
+      select: () => Promise.resolve({
+        _id: '507f1f77bcf86cd799439023',
+        sender: { toString: () => '507f1f77bcf86cd799439012' },
+        conversation: '507f1f77bcf86cd799439099',
+        isDeleted: false,
+        mediaUrl: null,
+        save: jest.fn(),
+      }),
     });
 
-    Conversation.findById.mockReturnValueOnce({
-      select() { return this; },
-      participants: [{ _id: '507f1f77bcf86cd799439011' }, { _id: '507f1f77bcf86cd799439012' }],
-    });
+    Conversation.findOne
+      .mockReturnValueOnce({
+        select: jest.fn().mockResolvedValue({
+          participants: [{ _id: '507f1f77bcf86cd799439011' }, { _id: '507f1f77bcf86cd799439012' }],
+        }),
+      })
+      .mockReturnValueOnce({
+        select: jest.fn().mockResolvedValue({
+          participants: [{ _id: '507f1f77bcf86cd799439011' }, { _id: '507f1f77bcf86cd799439012' }],
+        }),
+      });
 
     const response = await request(app)
       .delete('/delete/507f1f77bcf86cd799439023')

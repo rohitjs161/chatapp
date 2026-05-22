@@ -539,12 +539,16 @@ const ChatContainer = ({ onToggleRightSidebar, isRightSidebarOpen = false }) => 
     e.target.value = ''
   }
 
-  const handleDeleteMessage = async (messageId) => {
+  const handleDeleteMessage = async (messageId, isSender) => {
     if (isMessageActionPending) return
 
     try {
       await runMessageAction(async () => {
-        await deleteMsg(messageId)
+        if (isSender) {
+          await deleteMsg(messageId)
+        } else {
+          removeIncomingDelete(messageId)
+        }
         setActiveMenuId(null)
       })
     } catch (error) {
@@ -833,7 +837,7 @@ const ChatContainer = ({ onToggleRightSidebar, isRightSidebarOpen = false }) => 
         )}
         {showDelete && (
           <button
-            onClick={() => handleDeleteMessage(msg._id)}
+            onClick={() => handleDeleteMessage(msg._id, isSender)}
             disabled={isMessageActionPending}
             className={`${getItemClassName(true)} ${isMessageActionPending ? 'cursor-not-allowed opacity-60' : ''}`}
           >
@@ -998,7 +1002,7 @@ const ChatContainer = ({ onToggleRightSidebar, isRightSidebarOpen = false }) => 
                 const showDateSeparator = Boolean(currentDateKey && currentDateKey !== previousDateKey)
                 const dateLabel = showDateSeparator ? getDateLabel(msg.createdAt) : ''
                 const isEmojiOnly = isEmojiOnlyMessage(msg.content)
-                const isSender = msg.sender?._id === user?._id
+                const isSender = normalizeId(msg.sender?._id || msg.sender) === normalizeId(user?._id)
                 const isHovered = hoveredMessageId === msg._id
                 const isEditing = editingMessageId === msg._id
                 const canShowMenuTrigger = hasMessageActions(msg)
