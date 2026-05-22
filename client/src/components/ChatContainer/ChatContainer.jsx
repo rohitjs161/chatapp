@@ -9,6 +9,7 @@ import useActionLock from '../../hooks/useActionLock.js'
 import useNotificationStore from '../../store/notification.store.js'
 import { showMessageDesktopNotification } from '../../utils/desktopNotification.js'
 import { logger } from '../../utils/logger.js'
+import axiosInstance from '../../api/axios.js'
 
 const MESSAGE_CHAR_LIMIT = 1000
 const REQUEST_PENDING_TEXT_LIMIT = 2
@@ -38,6 +39,7 @@ const ChatContainer = ({ onToggleRightSidebar, isRightSidebarOpen = false }) => 
   const [activeDateBadge, setActiveDateBadge] = useState('')
   const [isRequestActionLoading, setIsRequestActionLoading] = useState(false)
   const [localPendingTextSent, setLocalPendingTextSent] = useState(0)
+  const [mediaPreviewUrls, setMediaPreviewUrls] = useState({})
 
   const menuRef = useRef(null)
   const messagesContainerRef = useRef(null)
@@ -46,6 +48,7 @@ const ChatContainer = ({ onToggleRightSidebar, isRightSidebarOpen = false }) => 
   const emojiPickerRef = useRef(null)
   const deliveredAckedMessageIdsRef = useRef(new Set())
   const typingExpiryTimersRef = useRef(new Map())
+  const mediaPreviewRef = useRef(new Map())
   const { isLocked: isMessageActionPending, runLockedAction: runMessageAction } = useActionLock()
 
   const scrollToBottom = (behavior = 'smooth') => {
@@ -571,12 +574,12 @@ const ChatContainer = ({ onToggleRightSidebar, isRightSidebarOpen = false }) => 
 
     try {
       await runMessageAction(async () => {
-        const response = await fetch(mediaUrl, { mode: 'cors' })
-        if (!response.ok) {
+        const response = await axiosInstance.get(mediaUrl, { responseType: 'blob' })
+        const blob = response?.data
+        if (!blob) {
           throw new Error('Failed to download media')
         }
 
-        const blob = await response.blob()
         const blobUrl = window.URL.createObjectURL(blob)
         const downloadLink = document.createElement('a')
         downloadLink.href = blobUrl
@@ -591,6 +594,58 @@ const ChatContainer = ({ onToggleRightSidebar, isRightSidebarOpen = false }) => 
       logger.error('Failed to download media:', error)
     }
   }
+
+  useEffect(() => {
+    const messageIdsInView = new Set(messages.map((msg) => String(msg?._id || '')).filter(Boolean))
+
+    for (const [messageId, objectUrl] of mediaPreviewRef.current.entries()) {
+      if (messageIdsInView.has(messageId)) continue
+      window.URL.revokeObjectURL(objectUrl)
+      mediaPreviewRef.current.delete(messageId)
+    }
+
+    setMediaPreviewUrls((prev) => {
+      const next = {}
+      Object.keys(prev).forEach((messageId) => {
+        if (messageIdsInView.has(messageId) && mediaPreviewRef.current.has(messageId)) {
+          next[messageId] = prev[messageId]
+        }
+      })
+      return next
+    })
+
+    const loadProtectedMediaPreview = async (msg) => {
+      const messageId = String(msg?._id || '')
+      const mediaUrl = msg?.mediaUrl
+      if (!messageId || !mediaUrl || mediaPreviewRef.current.has(messageId)) return
+
+      try {
+        const response = await axiosInstance.get(mediaUrl, { responseType: 'blob' })
+        if (!response?.data) return
+
+        const objectUrl = window.URL.createObjectURL(response.data)
+        mediaPreviewRef.current.set(messageId, objectUrl)
+        setMediaPreviewUrls((prev) => ({ ...prev, [messageId]: objectUrl }))
+      } catch (error) {
+        logger.error('Failed to load message media:', error)
+      }
+    }
+
+    messages.forEach((msg) => {
+      if (msg?.mediaUrl) {
+        loadProtectedMediaPreview(msg)
+      }
+    })
+  }, [messages])
+
+  useEffect(() => {
+    return () => {
+      for (const objectUrl of mediaPreviewRef.current.values()) {
+        window.URL.revokeObjectURL(objectUrl)
+      }
+      mediaPreviewRef.current.clear()
+    }
+  }, [])
 
   const handleStartEdit = (msg) => {
     if (isMessageActionPending) return
@@ -1068,12 +1123,18 @@ const ChatContainer = ({ onToggleRightSidebar, isRightSidebarOpen = false }) => 
                         >
                           {msg.mediaUrl ? (
                             <div className="space-y-2">
-                              <img
-                                src={msg.mediaUrl}
-                                alt="media"
-                                className="max-w-full h-auto rounded-lg cursor-pointer hover:opacity-90 transition-opacity"
-                                onClick={() => window.open(msg.mediaUrl, '_blank')}
-                              />
+                              {mediaPreviewUrls[String(msg._id)] ? (
+                                <img
+                                  src={mediaPreviewUrls[String(msg._id)]}
+                                  alt="media"
+                                  className="max-w-full h-auto rounded-lg cursor-pointer hover:opacity-90 transition-opacity"
+                                  onClick={() => window.open(mediaPreviewUrls[String(msg._id)], '_blank')}
+                                />
+                              ) : (
+                                <div className="flex h-40 w-56 items-center justify-center rounded-lg bg-gray-100 text-xs text-gray-500">
+                                  Loading image...
+                                </div>
+                              )}
                             </div>
                           ) : isEditing ? (
                             <div className="space-y-2">
