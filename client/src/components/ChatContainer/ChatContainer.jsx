@@ -16,6 +16,25 @@ const REQUEST_PENDING_TEXT_LIMIT = 2
 const normalizeId = (value) => String(value?._id || value?.id || value || '')
 const DAY_IN_MS = 24 * 60 * 60 * 1000
 
+const normalizeProtectedMediaPath = (mediaUrl) => {
+  if (!mediaUrl || typeof mediaUrl !== 'string') return ''
+
+  const trimmed = mediaUrl.trim()
+  if (!trimmed) return ''
+
+  // Absolute URLs should be used as-is.
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed
+  }
+
+  // axiosInstance already has /api/v1 as baseURL; avoid duplicated /api/v1/api/v1.
+  if (trimmed.startsWith('/api/v1/')) {
+    return trimmed.replace(/^\/api\/v1/, '')
+  }
+
+  return trimmed
+}
+
 const getStartOfDay = (date) => new Date(date.getFullYear(), date.getMonth(), date.getDate())
 
 const getCalendarDayDiffFromToday = (dateValue) => {
@@ -574,7 +593,8 @@ const ChatContainer = ({ onToggleRightSidebar, isRightSidebarOpen = false }) => 
 
     try {
       await runMessageAction(async () => {
-        const response = await axiosInstance.get(mediaUrl, { responseType: 'blob' })
+        const mediaRequestPath = normalizeProtectedMediaPath(mediaUrl)
+        const response = await axiosInstance.get(mediaRequestPath, { responseType: 'blob' })
         const blob = response?.data
         if (!blob) {
           throw new Error('Failed to download media')
@@ -616,7 +636,7 @@ const ChatContainer = ({ onToggleRightSidebar, isRightSidebarOpen = false }) => 
 
     const loadProtectedMediaPreview = async (msg) => {
       const messageId = String(msg?._id || '')
-      const mediaUrl = msg?.mediaUrl
+      const mediaUrl = normalizeProtectedMediaPath(msg?.mediaUrl)
       if (!messageId || !mediaUrl || mediaPreviewRef.current.has(messageId)) return
 
       try {
